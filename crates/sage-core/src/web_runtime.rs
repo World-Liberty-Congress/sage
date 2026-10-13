@@ -6812,19 +6812,6 @@ async fn resolve_public_actor(
     });
     if let Some(token) = user_token {
         if let Some(payload) = verify_user_session_token(&state.web_config.secret_key, &token) {
-            if payload.dev_mode {
-                return Ok(InternalAuthContext {
-                    id: -1,
-                    kind: "user".to_string(),
-                    approved: true,
-                    pubkey: None,
-                    email: Some("dev@localhost".to_string()),
-                    name: Some("Dev User".to_string()),
-                    user_type_id: None,
-                    dev_mode: true,
-                });
-            }
-
             let user = state
                 .internal
                 .user_record(payload.user_id)
@@ -6899,13 +6886,6 @@ async fn resolve_admin_actor(
 }
 
 fn verify_user_session_token(secret_key: &str, token: &str) -> Option<UserSessionTokenPayload> {
-    if token == "dev-mode-mock-token" {
-        return Some(UserSessionTokenPayload {
-            user_id: -1,
-            email: "dev-mode".to_string(),
-            dev_mode: true,
-        });
-    }
     let serializer = timed_serializer_with_signer(
         default_builder(secret_key.to_string())
             .with_salt(USER_SESSION_SALT)
@@ -6913,11 +6893,16 @@ fn verify_user_session_token(secret_key: &str, token: &str) -> Option<UserSessio
             .into_timestamp_signer(),
         PythonURLSafeEncoding,
     );
-    serializer
+    let payload = serializer
         .unsign::<UserSessionTokenPayload>(token)
         .ok()?
         .value_if_not_expired(Duration::from_secs(USER_SESSION_MAX_AGE_SECS))
-        .ok()
+        .ok()?;
+    // Matches the Enclave control plane, which rejects deprecated dev-mode sessions.
+    if payload.dev_mode {
+        return None;
+    }
+    Some(payload)
 }
 
 fn verify_admin_session_token(secret_key: &str, token: &str) -> Option<AdminSessionTokenPayload> {
@@ -11900,6 +11885,31 @@ mod tests {
 
         assert!(verify_admin_session_token_for_public_actor("test-secret", &token).is_none());
         assert!(verify_user_session_token("test-secret", &token).is_some());
+    }
+
+    #[test]
+    fn user_session_rejects_legacy_dev_mode_mock_token() {
+        assert!(verify_user_session_token("test-secret", "dev-mode-mock-token").is_none());
+    }
+
+    #[test]
+    fn user_session_rejects_signed_dev_mode_payload() {
+        let serializer = timed_serializer_with_signer(
+            default_builder("test-secret".to_string())
+                .with_salt(USER_SESSION_SALT)
+                .build()
+                .into_timestamp_signer(),
+            PythonURLSafeEncoding,
+        );
+        let token = serializer
+            .sign(&json!({
+                "user_id": -1,
+                "email": "dev-mode",
+                "dev_mode": true
+            }))
+            .expect("user token should serialize");
+
+        assert!(verify_user_session_token("test-secret", &token).is_none());
     }
 
     #[test]
