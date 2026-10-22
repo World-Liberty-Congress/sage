@@ -125,6 +125,7 @@ Active calls:
 - `POST /internal/agent/document-search`
 - `POST /internal/agent/resources/search` — accepts optional generic `query`, `kind`, `tags`, `region`, `language`, and pagination fields. It returns relevance-ranked generic Resources plus `total_count`, `returned_count`, `limit`, `offset`, `has_more`, and `next_offset` metadata. Exact normalized IDs, names, and pointers rank ahead of partial names, pointers, and descriptions.
 - `find_resources` exposes a smaller model-facing contract: optional `exact_resource`, `region`, `language`, and continuation `offset`. Sage maps `exact_resource` to the private endpoint's `query` field and leaves private `kind` and `tags` unset, removing guess-prone facets from the model without adding a classifier or forced lookup. The Conversation model decides whether to call the Tool and may use returned pagination metadata on a later turn. Sage validates arguments and backend page consistency, but does not force a lookup, rewrite the selected batch, or quarantine final prose for completeness claims.
+- `GET /internal/agent/admin-db-schema` — allowlisted live table/column/relationship metadata, SQL restrictions, encrypted-identity guidance, and recorded-usage semantics; no row values.
 - `POST /internal/agent/admin-db-query`
 
 ADR-0023 target calls:
@@ -226,7 +227,7 @@ Current protections in `web_runtime.rs`:
 - native bearer and cookie auth verification
 - cookie-origin CSRF checks for unsafe browser requests
 - `tool_context` restricted to admins
-- `db_query` restricted to admins
+- `db_schema` and `db_query` restricted to Admin turns with the Database (`db-query`) tool set enabled. Schema discovery precedes natural-language queries. Usage defaults to retained user-session recorded turns (both roles), excludes Admin tests, and must be labeled with coverage; Sage's live Postgres messages are outside this SQLite surface. The signer-decrypted roster may be partial, so missing names fall back to user IDs.
 - session ownership enforced in `ensure_session_access`
 - private contract protected by `INTERNAL_AGENT_TOKEN`
 

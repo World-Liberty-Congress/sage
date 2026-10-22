@@ -1230,6 +1230,20 @@ impl InternalAgentClient {
         self.send_read_only_tool_json(request).await
     }
 
+    async fn admin_db_schema(&self, table: Option<&str>) -> Result<Value> {
+        let mut request = self
+            .http
+            .get(format!(
+                "{}/internal/agent/admin-db-schema",
+                self.backend_url
+            ))
+            .header("X-Internal-Agent-Token", &self.internal_agent_token);
+        if let Some(table) = table {
+            request = request.query(&[("table", table)]);
+        }
+        self.send_read_only_tool_json(request).await
+    }
+
     async fn admin_db_query(&self, sql: &str) -> Result<Value> {
         let request = self
             .http
@@ -1566,6 +1580,12 @@ impl SearxWebSearchTool {
 
         Ok(json!({ "query": query, "results": results }))
     }
+}
+
+#[derive(Clone)]
+struct AdminDbSchemaTool {
+    internal: InternalAgentClient,
+    traces: Arc<Mutex<Vec<ToolCallInfoResponse>>>,
 }
 
 #[derive(Clone)]
@@ -1923,6 +1943,7 @@ fn tool_trace_title(tool_name: &str) -> String {
         "web_search" => "Web Search",
         "find_resources" => "Curated Resources",
         "db_query" => "Database Query",
+        "db_schema" => "Database Schema",
         "read_admin_setup_summary"
         | "read_instance_settings"
         | "read_deployment_settings"
@@ -2437,6 +2458,10 @@ fn build_conversation_tool_registry_with_context(
     }
 
     if auth.kind == "admin" && request.tools.iter().any(|tool| tool == "db-query") {
+        registry.register(Arc::new(AdminDbSchemaTool {
+            internal: internal.clone(),
+            traces: sinks.traces.clone(),
+        }));
         registry.register(Arc::new(AdminDbQueryTool {
             internal: internal.clone(),
             traces: sinks.traces.clone(),
@@ -3563,13 +3588,56 @@ impl Tool for AdminConfigDirectTool {
 }
 
 #[async_trait::async_trait]
+impl Tool for AdminDbSchemaTool {
+    fn name(&self) -> &str {
+        "db_schema"
+    }
+
+    fn description(&self) -> &str {
+        "Discover Admin database structure before db_query. Omit table for a compact catalog, query rules, usage-ranking example, and encrypted-identity guidance. Set table to a catalog name for its live columns and relationships. No row values."
+    }
+
+    fn native_parameters(&self) -> Result<Value> {
+        Ok(json!({
+            "type": "object",
+            "properties": {
+                "table": {"type": "string", "description": "Optional exact table name from the catalog. Omit to discover available tables and usage guidance."}
+            },
+            "required": [],
+            "additionalProperties": false
+        }))
+    }
+
+    async fn execute_native(&self, args: &ToolArgs) -> Result<NativeToolResult> {
+        let value = self
+            .internal
+            .admin_db_schema(tool_string_arg(args, "table"))
+            .await?;
+        if let Ok(mut sink) = self.traces.lock() {
+            sink.push(ToolCallInfoResponse {
+                tool_id: "db-query".to_string(),
+                tool_name: "Database Schema".to_string(),
+                query: Some("read-only database schema".to_string()),
+                output_summary: Some(
+                    "Available database structure and query guidance loaded.".to_string(),
+                ),
+                warnings: Vec::new(),
+                metadata: json!({}),
+                guarded: false,
+            });
+        }
+        Ok(NativeToolResult::success(value))
+    }
+}
+
+#[async_trait::async_trait]
 impl Tool for AdminDbQueryTool {
     fn name(&self) -> &str {
         "db_query"
     }
 
     fn description(&self) -> &str {
-        "Inspect enclave.free's SQLite admin data. Use this for Admin database questions when live database facts would improve the answer. Generate one read-only SQLite SELECT query; the safe executor enforces read-only validation, table allowlists, truncation, and trace redaction."
+        "Inspect enclave.free's SQLite admin data. First call db_schema to discover available tables, columns, joins, and usage semantics. Generate one read-only SQLite SELECT without a semicolon. The safe executor enforces read-only validation and table allowlists; results are redacted from traces."
     }
 
     fn native_parameters(&self) -> Result<Value> {
@@ -4225,9 +4293,10 @@ fn database_tool_turn_guidance(
     }
 
     Some(
-        "db-query is enabled for this Admin turn. When live SQLite data would answer better than guessing or asking the Admin to check manually, call db_query with one read-only SQLite SELECT query.\n\
+        "db-query is enabled for this Admin turn. For database questions, first call db_schema to discover the live allowlisted tables, columns, relationships, and metric definitions; then call db_query with one read-only SQLite SELECT query. Do not guess table names or claim there is no usage data before checking the schema.\n\
 You may translate the Admin's natural-language database question into a safe SELECT yourself. Do not ask the Admin to resubmit SQL solely because the request is natural language.\n\
-The Python safe SQL executor enforces SELECT-only validation, blocked mutation keywords, table allowlists, truncation, and trace redaction. Direct database mutation is not supported.",
+For usage rankings, follow the schema's usage guidance and state the metric and coverage. Exclude Admin test sessions (source='admin_test') from real-user activity. Match returned user IDs to supplied AdminSigner-DecryptedContext for names when available; do not infer missing identities.\n\
+The Python safe SQL executor enforces SELECT-only validation, blocked mutation keywords, and table allowlists. Results are redacted from traces. Direct database mutation is not supported.",
     )
 }
 
@@ -14347,6 +14416,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn database_schema_tool_uses_internal_auth_and_keeps_structure_out_of_traces() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test backend should bind");
+        let addr = listener.local_addr().unwrap();
+        async fn schema(
+            headers: HeaderMap,
+            Query(query): Query<HashMap<String, String>>,
+        ) -> Json<Value> {
+            assert_eq!(headers.get("x-internal-agent-token").unwrap(), "test-token");
+            Json(json!({
+                "requested_table": query.get("table"),
+                "dialect": "SQLite",
+                "tables": [{
+                    "name": "session_logs",
+                    "columns": [{"name": "SENTINEL_SCHEMA_COLUMN"}]
+                }]
+            }))
+        }
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/internal/agent/admin-db-schema", get(schema)),
+            )
+            .await
+            .unwrap();
+        });
+        let traces = Arc::new(Mutex::new(Vec::new()));
+        let tool = AdminDbSchemaTool {
+            internal: InternalAgentClient::new(
+                Client::new(),
+                format!("http://{addr}"),
+                "test-token".to_string(),
+            ),
+            traces: traces.clone(),
+        };
+        let result = tool.execute_native(&ToolArgs::new()).await.unwrap();
+        let table_result = tool
+            .execute_native(&ToolArgs::from([(
+                "table".to_string(),
+                json!("session_logs"),
+            )]))
+            .await
+            .unwrap();
+        server.abort();
+        assert!(result.is_success());
+        assert!(result
+            .model_value()
+            .to_string()
+            .contains("SENTINEL_SCHEMA_COLUMN"));
+        assert_eq!(
+            table_result.model_value()["requested_table"],
+            "session_logs"
+        );
+        let traces = traces.lock().unwrap();
+        assert_eq!(traces.len(), 2);
+        assert_eq!(traces[0].tool_name, "Database Schema");
+        assert!(!serde_json::to_string(&*traces)
+            .unwrap()
+            .contains("SENTINEL_SCHEMA_COLUMN"));
+    }
+
+    #[tokio::test]
+    async fn database_schema_tool_authorization_failure_is_typed_and_sanitized() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/internal/agent/admin-db-schema",
+                    get(|| async { (StatusCode::FORBIDDEN, "SENTINEL_PRIVATE_SCHEMA_DETAIL") }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(AdminDbSchemaTool {
+            internal: InternalAgentClient::new(
+                Client::new(),
+                format!("http://{addr}"),
+                "test-token".to_string(),
+            ),
+            traces: Arc::new(Mutex::new(Vec::new())),
+        }));
+        let mut agent = SageAgent::new_without_memory(registry, "test");
+        let result = agent
+            .execute_native_tool_calls(
+                1,
+                &[native_test_call(
+                    "call-schema-unauthorized",
+                    "db_schema",
+                    ToolArgs::new(),
+                )],
+            )
+            .await;
+        server.abort();
+        let value = result.executed_tools[0].result.model_value();
+        assert_eq!(value["error"]["code"], "unauthorized");
+        assert!(!value.to_string().contains("SENTINEL_PRIVATE_SCHEMA_DETAIL"));
+    }
+
+    #[tokio::test]
     async fn database_tool_rejected_select_returns_failed_guarded_result() {
         let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<(Option<String>, Value)>();
         let seen_tx = Arc::new(Mutex::new(Some(seen_tx)));
@@ -15798,6 +15971,7 @@ mod tests {
         assert!(registry.has("find_resources"));
         assert!(registry.has("web_search"));
         assert!(registry.has("db_query"));
+        assert!(registry.has("db_schema"));
         assert!(registry.has("read_admin_setup_summary"));
         assert!(registry.has("read_instance_settings"));
         assert!(registry.has("read_deployment_settings"));
@@ -15878,6 +16052,7 @@ mod tests {
         assert!(user_registry.has("find_resources"));
         assert!(user_registry.has("web_search"));
         assert!(!user_registry.has("db_query"));
+        assert!(!user_registry.has("db_schema"));
         assert!(!user_registry.has("read_admin_setup_summary"));
         assert!(!user_registry.has("read_instance_settings"));
         assert!(!user_registry.has("configure_instance"));
@@ -15902,6 +16077,7 @@ mod tests {
         assert!(!disabled_registry.has("find_resources"));
         assert!(!disabled_registry.has("web_search"));
         assert!(!disabled_registry.has("db_query"));
+        assert!(!disabled_registry.has("db_schema"));
         assert!(!disabled_registry.has("read_admin_setup_summary"));
         assert!(!disabled_registry.has("read_instance_settings"));
         assert!(!disabled_registry.has("configure_instance"));
@@ -15958,6 +16134,7 @@ mod tests {
         );
 
         assert!(registry.has("db_query"));
+        assert!(registry.has("db_schema"));
         assert!(sinks
             .traces
             .lock()
@@ -16096,6 +16273,7 @@ mod tests {
 
         assert!(input.contains("=== TOOL GUIDANCE ==="));
         assert!(input.contains("db-query is enabled"));
+        assert!(input.contains("first call db_schema"));
         assert!(input.contains("call db_query with one read-only SQLite SELECT"));
         assert!(input.contains("natural-language database question"));
         assert!(input.contains("Do not ask the Admin to resubmit SQL"));
@@ -16144,6 +16322,7 @@ mod tests {
         );
 
         assert!(registry.has("db_query"));
+        assert!(registry.has("db_schema"));
         assert!(sinks
             .traces
             .lock()
