@@ -134,3 +134,15 @@ For the current branch story, start with:
 - [`TODO.md`](TODO.md)
 
 Older design docs such as `docs/brainstorm.md`, `docs/roadmap.md`, and `docs/SAGE_V2_DESIGN.md` are now historical background only.
+
+### Admin browser user lookup
+
+Live Admin Database streams may enable `read_users` and `search_users` when an
+authenticated cookie session advertises browser capability. A dedicated
+`user_lookup_request` SSE event asks that browser to decrypt selected fields;
+`POST /llm/chat/user-lookup-result` validates the correlated, bounded reply.
+The pending-call module owns the 120-second deadline and cleanup. Without the
+capability the agent retains SQL/ID answers. Raw lookup values and predicates
+are transient model input, omitted from traces and persisted tool messages.
+The parent application defines the shared contract in
+`docs/contracts/admin-user-lookup.md`.
