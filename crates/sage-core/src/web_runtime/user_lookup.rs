@@ -1328,4 +1328,52 @@ mod tests {
             assert!(content.len() < 1500);
         }
     }
+    #[tokio::test]
+    async fn conversation_lookup_accepts_microsecond_boundaries_and_content_free_unreadable_records(
+    ) {
+        let (pending, registry, _guard, mut requests, _) = setup_for("conversation_lookup");
+        let tool = registry.get("read_conversations").unwrap().clone();
+        let task = tokio::spawn(async move {
+            tool.execute_native(&ToolArgs::from_json_object(&json!({"select":"transcript","start":"2026-10-20T10:00:00.000001Z","end":"2026-10-20T10:00:00.000002Z"})).unwrap()).await.unwrap()
+        });
+        let req = requests.recv().await.unwrap();
+        let mut answer = conversation_answer();
+        answer["records"][0]["timestamp"] = json!("2026-10-20T10:00:00.000000Z");
+        assert!(pending
+            .submit(
+                1,
+                "session-one",
+                &"a".repeat(64),
+                submission(&req, answer.clone())
+            )
+            .is_err());
+        answer["records"][0]["timestamp"] = json!("2026-10-20T10:00:00.000001Z");
+        pending
+            .submit(
+                1,
+                "session-one",
+                &"a".repeat(64),
+                submission(&req, answer.clone()),
+            )
+            .unwrap();
+        assert_eq!(task.await.unwrap().model_value(), answer);
+        let tool = registry.get("read_conversations").unwrap().clone();
+        let task =
+            tokio::spawn(async move { tool.execute_native(&ToolArgs::new()).await.unwrap() });
+        let req = requests.recv().await.unwrap();
+        let mut unreadable = conversation_answer();
+        unreadable["records"][0]["status"] = json!("unreadable");
+        unreadable["records"][0]["role"] = Value::Null;
+        unreadable["records"][0]["text"] = Value::Null;
+        unreadable["coverage"]["unreadable_records"] = json!(1);
+        pending
+            .submit(
+                1,
+                "session-one",
+                &"a".repeat(64),
+                submission(&req, unreadable.clone()),
+            )
+            .unwrap();
+        assert_eq!(task.await.unwrap().model_value(), unreadable);
+    }
 }
