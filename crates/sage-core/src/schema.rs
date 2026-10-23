@@ -186,6 +186,7 @@ diesel::table! {
         title -> Nullable<Text>,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
+        session_log_retry_at -> Nullable<Timestamptz>,
     }
 }
 
