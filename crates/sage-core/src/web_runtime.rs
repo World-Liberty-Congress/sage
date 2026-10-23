@@ -5270,7 +5270,12 @@ const SESSION_LOG_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 const SESSION_LOG_RETRY_BATCH: i64 = 50;
 const SESSION_LOG_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-fn records_user_session_log(auth: &InternalAuthContext) -> bool {
+/// Message roles that make up a User Conversation record; tool context and
+/// other internal messages stay out of it.
+const RECORDED_MESSAGE_ROLES: [&str; 2] = ["user", "assistant"];
+
+/// Whether this actor's Conversations are recorded for Admin review.
+fn has_recorded_conversations(auth: &InternalAuthContext) -> bool {
     auth.kind == "user" && auth.id != -1
 }
 
@@ -5290,7 +5295,7 @@ fn session_log_record(messages: Vec<StoredMessageRow>) -> Option<SessionLogRecor
     let mut through_sequence_id = None;
     let messages = messages
         .into_iter()
-        .filter(|message| matches!(message.role.as_str(), "user" | "assistant"))
+        .filter(|message| RECORDED_MESSAGE_ROLES.contains(&message.role.as_str()))
         .map(|message| {
             through_sequence_id = through_sequence_id.max(Some(message.sequence_id));
             InternalSessionLogMessage {
@@ -5317,7 +5322,7 @@ fn mark_user_session_log_pending(
     auth: &InternalAuthContext,
     session_id: Uuid,
 ) -> Option<chrono::DateTime<chrono::Utc>> {
-    if !records_user_session_log(auth) {
+    if !has_recorded_conversations(auth) {
         return None;
     }
     match set_session_log_retry_at(state, session_id) {
@@ -5411,7 +5416,7 @@ fn clear_session_log_retry(
 ) -> AppResult<()> {
     let newer_messages = messages::table
         .filter(messages::agent_id.eq(session.agent_id))
-        .filter(messages::role.eq_any(["user", "assistant"]))
+        .filter(messages::role.eq_any(RECORDED_MESSAGE_ROLES))
         .filter(messages::sequence_id.gt(recorded_through_sequence_id));
     let mut conn = state
         .db
@@ -12457,12 +12462,12 @@ mod tests {
             user_type_id: None,
             dev_mode: false,
         };
-        assert!(records_user_session_log(&actor));
+        assert!(has_recorded_conversations(&actor));
         actor.id = -1;
-        assert!(!records_user_session_log(&actor));
+        assert!(!has_recorded_conversations(&actor));
         actor.id = 1;
         actor.kind = "admin".to_string();
-        assert!(!records_user_session_log(&actor));
+        assert!(!has_recorded_conversations(&actor));
     }
 
     #[test]
