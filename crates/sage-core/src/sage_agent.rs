@@ -1162,6 +1162,7 @@ pub enum AgentTraceEvent {
         outcome: String,
     },
     ModelUsageObservation {
+        model: String,
         step: usize,
         attempt: u32,
         prompt_tokens: Option<u64>,
