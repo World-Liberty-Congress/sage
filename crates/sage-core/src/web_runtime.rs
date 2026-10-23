@@ -38,6 +38,10 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
+use crate::admin_config_views::{
+    agent_settings_view, AgentSetting, AgentSettingOverride, AgentSettingsSnapshot, ReadView,
+    ReadViewError, UserTypeAgentOverrides, READ_RESULT_BUDGET_CHARS,
+};
 use crate::config::Config;
 use crate::memory::MemoryManager;
 use crate::openai_native::{
@@ -1612,6 +1616,7 @@ struct AdminConfigReadTool {
     auth: InternalAuthContext,
     name: String,
     endpoint: String,
+    view: ReadView,
     description: String,
     traces: Arc<Mutex<Vec<ToolCallInfoResponse>>>,
 }
@@ -1626,7 +1631,8 @@ struct AdminConfigSetupSummaryTool {
 
 #[derive(Clone)]
 struct AdminAgentSettingsReadTool {
-    state: WebAppState,
+    internal: InternalAgentClient,
+    state: Option<WebAppState>,
     auth: InternalAuthContext,
     traces: Arc<Mutex<Vec<ToolCallInfoResponse>>>,
 }
@@ -2487,58 +2493,56 @@ fn build_conversation_tool_registry_with_context(
             auth: auth.clone(),
             traces: sinks.traces.clone(),
         }));
-        for (name, endpoint, description) in [
+        registry.register(Arc::new(AdminAgentSettingsReadTool {
+            internal: internal.clone(),
+            state: state.cloned(),
+            auth: auth.clone(),
+            traces: sinks.traces.clone(),
+        }));
+        for (name, endpoint, view, description) in [
             (
                 "read_instance_settings",
                 "instance-settings",
-                "Read instance branding, language, theme, access, and public UI settings.",
+                ReadView::InstanceSettings,
+                "Read Instance Settings: branding, language, theme, access, and public UI. Without keys, returns every setting with long values shortened; set keys for full values and supported values.",
             ),
             (
                 "read_deployment_settings",
                 "deployment-settings",
-                "Read masked Deployment Settings, including configured/unconfigured secret status.",
+                ReadView::DeploymentSettings,
+                "Read masked Deployment Settings, including configured/unconfigured secret status. Without arguments, returns counts by category and a page of settings; filter by category, or set keys for full detail with descriptions. secret and requires_restart appear on a row only when true.",
             ),
             (
                 "read_deployment_readiness",
                 "deployment-readiness",
+                ReadView::DeploymentReadiness,
                 "Read deployment readiness checks and remaining deployment handoffs.",
-            ),
-            (
-                "read_agent_settings",
-                "agent-settings",
-                "Read global and per-user-type Sage Agent Settings.",
             ),
             (
                 "read_user_types",
                 "user-types",
-                "Read configured user types and onboarding questions.",
+                ReadView::UserTypes,
+                "Read User Types and Onboarding Questions. Without user_type, returns the User Type list and global question names; set user_type (name or id) for its full record and every Onboarding Question it sees.",
             ),
             (
                 "read_document_access",
                 "document-access",
-                "Read global and per-user-type Document Access defaults and overrides.",
+                ReadView::DocumentAccess,
+                "Read Document Access. Without arguments, returns counts, User Types with overrides, and Documents with global access. Set user_type (name or id) for that User Type's effective access and its source; narrow with document (filename text or job_id) and access.",
             ),
             (
                 "read_onboarding_status",
                 "onboarding-status",
-                "Read first-admin setup state and guided bootstrap checklist status.",
+                ReadView::OnboardingStatus,
+                "Read first-admin setup state, the guided bootstrap checklist, and User Type and Onboarding Question counts. Use read_user_types for details.",
             ),
         ] {
-            if name == "read_agent_settings" {
-                if let Some(state) = state.cloned() {
-                    registry.register(Arc::new(AdminAgentSettingsReadTool {
-                        state,
-                        auth: auth.clone(),
-                        traces: sinks.traces.clone(),
-                    }));
-                    continue;
-                }
-            }
             registry.register(Arc::new(AdminConfigReadTool {
                 internal: internal.clone(),
                 auth: auth.clone(),
                 name: name.to_string(),
                 endpoint: endpoint.to_string(),
+                view,
                 description: description.to_string(),
                 traces: sinks.traces.clone(),
             }));
@@ -2873,10 +2877,14 @@ impl Tool for AdminConfigReadTool {
     }
 
     fn native_parameters(&self) -> Result<Value> {
-        Ok(empty_native_parameters())
+        Ok(self.view.native_parameters())
     }
 
-    async fn execute_native(&self, _args: &ToolArgs) -> Result<NativeToolResult> {
+    async fn execute_native(&self, args: &ToolArgs) -> Result<NativeToolResult> {
+        let read_args = match self.view.parse_args(args) {
+            Ok(read_args) => read_args,
+            Err(error) => return Ok(read_view_failure(error)),
+        };
         let response = match self
             .internal
             .admin_config_tool(&self.endpoint, &self.auth)
@@ -2885,27 +2893,84 @@ impl Tool for AdminConfigReadTool {
             Ok(response) => response,
             Err(error) => return Ok(admin_config_native_failure(error)),
         };
+        let result = admin_config_read_result(
+            response.version,
+            &response.tool,
+            &response.generated_at,
+            response.secret_policy.clone(),
+            &response.warnings,
+            |budget| self.view.apply(&response.data, &read_args, budget),
+        );
 
         if let Ok(mut sink) = self.traces.lock() {
-            sink.push(ToolCallInfoResponse {
-                tool_id: format!("admin-config:{}", self.name),
-                tool_name: "Admin Config".to_string(),
-                query: Some(self.name.clone()),
-                output_summary: Some(format!("Read {}.", self.name)),
-                warnings: response.warnings.clone(),
-                metadata: json!({}),
-                guarded: false,
-            });
+            sink.push(admin_config_read_trace(
+                &self.name,
+                &response.warnings,
+                &result,
+            ));
         }
+        Ok(result)
+    }
+}
 
-        Ok(NativeToolResult::success(json!({
-            "version": response.version,
-            "tool": response.tool,
-            "generated_at": response.generated_at,
-            "secret_policy": response.secret_policy,
-            "warnings": response.warnings,
-            "data": response.data,
-        })))
+/// Wraps a shaped Admin Config read in the common response envelope. The
+/// view receives whatever part of the read budget the envelope leaves.
+fn admin_config_read_result(
+    version: i32,
+    tool: &str,
+    generated_at: &str,
+    secret_policy: Value,
+    warnings: &[String],
+    view: impl FnOnce(usize) -> std::result::Result<Value, ReadViewError>,
+) -> NativeToolResult {
+    let mut envelope = json!({
+        "version": version,
+        "tool": tool,
+        "generated_at": generated_at,
+        "secret_policy": secret_policy,
+        "warnings": warnings,
+        "data": {},
+    });
+    let budget =
+        READ_RESULT_BUDGET_CHARS.saturating_sub(crate::admin_config_views::char_len(&envelope));
+    match view(budget) {
+        Ok(data) => {
+            envelope["data"] = data;
+            NativeToolResult::success(envelope)
+        }
+        Err(error) => read_view_failure(error),
+    }
+}
+
+fn read_view_failure(error: ReadViewError) -> NativeToolResult {
+    NativeToolResult::failure(error.code(), error.message())
+}
+
+fn admin_config_read_trace(
+    name: &str,
+    warnings: &[String],
+    result: &NativeToolResult,
+) -> ToolCallInfoResponse {
+    let output_summary = match result {
+        NativeToolResult::Success(value) => match value.pointer("/data/page") {
+            Some(page) => format!(
+                "Read {}: {} of {} item(s).",
+                name,
+                page.get("returned").and_then(Value::as_u64).unwrap_or(0),
+                page.get("total_count").and_then(Value::as_u64).unwrap_or(0),
+            ),
+            None => format!("Read {}.", name),
+        },
+        _ => format!("{} could not apply the requested scope.", name),
+    };
+    ToolCallInfoResponse {
+        tool_id: format!("admin-config:{}", name),
+        tool_name: "Admin Config".to_string(),
+        query: Some(name.to_string()),
+        output_summary: Some(output_summary),
+        warnings: warnings.to_vec(),
+        metadata: json!({}),
+        guarded: false,
     }
 }
 
@@ -3059,76 +3124,114 @@ impl Tool for AdminAgentSettingsReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read global and per-user-type Sage Agent Settings."
+        "Read Sage Agent Settings. Without arguments, returns global values with long text shortened and which keys each User Type overrides. Set user_type (name or id) for that User Type's effective values and their source; set keys for full untruncated values."
     }
 
     fn native_parameters(&self) -> Result<Value> {
-        Ok(empty_native_parameters())
+        Ok(ReadView::AgentSettings.native_parameters())
     }
 
-    async fn execute_native(&self, _args: &ToolArgs) -> Result<NativeToolResult> {
-        let global = match load_ai_config_response(&self.state) {
-            Ok(response) => response,
-            Err(error) => {
-                return Ok(NativeToolResult::failure("execution_failed", error.message));
-            }
+    async fn execute_native(&self, args: &ToolArgs) -> Result<NativeToolResult> {
+        let read_args = match ReadView::AgentSettings.parse_args(args) {
+            Ok(read_args) => read_args,
+            Err(error) => return Ok(read_view_failure(error)),
         };
-        let user_types_response = match self
-            .state
-            .internal
-            .admin_config_tool("user-types", &self.auth)
-            .await
-        {
-            Ok(response) => response,
+        let (snapshot, warnings) = match self.snapshot().await {
+            Ok(loaded) => loaded,
             Err(error) => return Ok(admin_config_native_failure(error)),
         };
-        let user_types: Vec<InternalUserTypeResponse> = match serde_json::from_value(
+        let result = admin_config_read_result(
+            1,
+            "read_agent_settings",
+            &chrono::Utc::now().to_rfc3339(),
+            json!({ "mode": "masked" }),
+            &warnings,
+            |budget| agent_settings_view(&snapshot, &read_args, budget),
+        );
+
+        if let Ok(mut sink) = self.traces.lock() {
+            sink.push(admin_config_read_trace(
+                "read_agent_settings",
+                &warnings,
+                &result,
+            ));
+        }
+        Ok(result)
+    }
+}
+
+impl AdminAgentSettingsReadTool {
+    /// Loads Sage-owned Agent Settings, or the control-plane copy when this
+    /// registry has no Sage state.
+    async fn snapshot(
+        &self,
+    ) -> std::result::Result<(AgentSettingsSnapshot, Vec<String>), AdminConfigToolError> {
+        let Some(state) = self.state.as_ref() else {
+            let response = self
+                .internal
+                .admin_config_tool("agent-settings", &self.auth)
+                .await?;
+            let snapshot = AgentSettingsSnapshot::from_control_plane(&response.data)
+                .map_err(|error| AdminConfigToolError::Execution(error.message()))?;
+            return Ok((snapshot, response.warnings));
+        };
+
+        let user_types_response = self
+            .internal
+            .admin_config_tool("user-types", &self.auth)
+            .await?;
+        let user_types: Vec<InternalUserTypeResponse> = serde_json::from_value(
             user_types_response
                 .data
                 .get("user_types")
                 .cloned()
                 .unwrap_or_else(|| json!([])),
-        ) {
-            Ok(user_types) => user_types,
-            Err(_) => {
-                return Ok(NativeToolResult::failure(
-                    "execution_failed",
-                    "Admin Config returned invalid user type data.",
-                ));
-            }
+        )
+        .map_err(|_| {
+            AdminConfigToolError::Execution(
+                "Admin Config returned invalid user type data.".to_string(),
+            )
+        })?;
+        let global = load_ai_config_response(state)
+            .map_err(|error| AdminConfigToolError::Execution(error.message))?;
+        let mut snapshot = AgentSettingsSnapshot {
+            global: global
+                .prompt_sections
+                .into_iter()
+                .chain(global.parameters)
+                .chain(global.defaults)
+                .map(|item| AgentSetting {
+                    key: item.key,
+                    value: item.value,
+                    value_type: item.value_type,
+                    category: item.category,
+                    description: item.description,
+                    updated_at: item.updated_at,
+                })
+                .collect(),
+            user_types: Vec::new(),
         };
-        let mut per_user_type = Vec::new();
         for user_type in user_types {
-            match load_ai_config_user_type_response(&self.state, &user_type) {
-                Ok(response) => per_user_type.push(response),
-                Err(error) => {
-                    return Ok(NativeToolResult::failure("execution_failed", error.message));
-                }
-            }
-        }
-        let warnings = user_types_response.warnings.clone();
-        let data = sage_agent_settings_tool_data_from_responses(global, per_user_type);
-
-        if let Ok(mut sink) = self.traces.lock() {
-            sink.push(ToolCallInfoResponse {
-                tool_id: "admin-config:read_agent_settings".to_string(),
-                tool_name: "Admin Config".to_string(),
-                query: Some("read_agent_settings".to_string()),
-                output_summary: Some("Read read_agent_settings.".to_string()),
-                warnings: warnings.clone(),
-                metadata: json!({}),
-                guarded: false,
+            let overrides = load_ai_config_override_rows(state, user_type.id)
+                .map_err(|error| AdminConfigToolError::Execution(error.message))?;
+            snapshot.user_types.push(UserTypeAgentOverrides {
+                id: i64::from(user_type.id),
+                name: user_type.name,
+                overrides: overrides
+                    .into_iter()
+                    .map(|row| {
+                        (
+                            row.ai_config_key,
+                            AgentSettingOverride {
+                                value: row.value,
+                                updated_at: Some(row.updated_at.to_rfc3339()),
+                            },
+                        )
+                    })
+                    .collect(),
             });
         }
-
-        Ok(NativeToolResult::success(json!({
-            "version": 1,
-            "tool": "read_agent_settings",
-            "generated_at": chrono::Utc::now().to_rfc3339(),
-            "secret_policy": { "mode": "masked" },
-            "warnings": warnings,
-            "data": data,
-        })))
+        Ok((snapshot, user_types_response.warnings))
     }
 }
 
@@ -6337,9 +6440,9 @@ fn build_admin_setup_summary_tool_data(
     let user_type_count = i64_at(onboarding_status, &["user_types_setup", "count"]);
     let required_user_type_minimum =
         i64_at(onboarding_status, &["user_types_setup", "required_minimum"]);
-    let onboarding_question_count =
-        i64_at(user_types, &["limits", "onboarding_questions_returned"]);
+    let onboarding_question_count = distinct_onboarding_question_count(user_types) as i64;
     let document_count = i64_at(document_access, &["limits", "documents_returned"]);
+    let document_overrides = document_override_counts(document_access);
     let default_document_count =
         array_len_at(document_access, &["global", "default_document_ids"]) as i64;
     let deployment_summary = value_at(deployment_readiness, &["summary"])
@@ -6394,19 +6497,6 @@ fn build_admin_setup_summary_tool_data(
         missing.push(item.clone());
     }
 
-    let mut next_actions = missing
-        .iter()
-        .filter_map(|item| {
-            item.get("next_action")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .take(5)
-        .collect::<Vec<_>>();
-    if next_actions.is_empty() {
-        next_actions.push("No immediate Admin Config setup action is required.".to_string());
-    }
-
     let status = if deployment_status == "blocked" {
         "blocked"
     } else if deployment_status == "warnings" || !missing.is_empty() {
@@ -6435,9 +6525,10 @@ fn build_admin_setup_summary_tool_data(
                 "count": onboarding_question_count,
             },
             "document_access": {
-                "documents_returned": document_count,
+                "documents": document_count,
                 "default_document_count": default_document_count,
-                "user_type_overrides_returned": array_len_at(document_access, &["per_user_type"]),
+                "user_types_with_overrides": document_overrides.len(),
+                "user_type_overrides": document_overrides.iter().sum::<usize>(),
             },
             "agent_settings": agent_setting_counts,
             "deployment_settings": deployment_setting_counts,
@@ -6447,7 +6538,6 @@ fn build_admin_setup_summary_tool_data(
             "summary": deployment_summary,
         },
         "missing": missing,
-        "next_actions": next_actions,
         "read_sources": [
             "instance_settings",
             "deployment_settings",
@@ -6477,6 +6567,48 @@ fn admin_setup_summary_headline(status: &str, missing_count: usize) -> String {
         ),
         (_, count) => format!("Admin setup has {} item(s) needing attention.", count),
     }
+}
+
+/// Global Onboarding Questions repeat inside every User Type, so count ids.
+fn distinct_onboarding_question_count(user_types: &Value) -> usize {
+    value_at(user_types, &["onboarding_questions"])
+        .and_then(Value::as_array)
+        .map(|questions| {
+            questions
+                .iter()
+                .filter_map(|question| question.get("id").map(Value::to_string))
+                .collect::<HashSet<_>>()
+                .len()
+        })
+        .unwrap_or(0)
+}
+
+/// Document Access override counts for each User Type that has any.
+fn document_override_counts(document_access: &Value) -> Vec<usize> {
+    value_at(document_access, &["per_user_type"])
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|entry| {
+                    entry
+                        .get("documents")
+                        .and_then(Value::as_array)
+                        .map(|documents| {
+                            documents
+                                .iter()
+                                .filter(|document| {
+                                    document.get("is_override").and_then(Value::as_bool)
+                                        == Some(true)
+                                })
+                                .count()
+                        })
+                        .unwrap_or(0)
+                })
+                .filter(|count| *count > 0)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn value_at<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
@@ -15487,6 +15619,7 @@ mod tests {
             auth: auth.clone(),
             name: "read_instance_settings".to_string(),
             endpoint: "instance-settings".to_string(),
+            view: ReadView::InstanceSettings,
             description: "Read instance settings.".to_string(),
             traces: Arc::new(Mutex::new(Vec::new())),
         };
@@ -15681,6 +15814,7 @@ mod tests {
             },
             name: "read_deployment_readiness".to_string(),
             endpoint: "deployment-readiness".to_string(),
+            view: ReadView::DeploymentReadiness,
             description: "Read deployment readiness.".to_string(),
             traces: traces.clone(),
         };
@@ -15839,15 +15973,46 @@ mod tests {
         );
         assert_eq!(data["missing"][0]["area"], "instance_settings");
         assert_eq!(
-            data["next_actions"][0],
+            data["missing"][0]["next_action"],
             "Finish guided setup, confirm the intended configuration, and apply it with configure_instance."
         );
+        assert!(data.get("next_actions").is_none());
         assert_eq!(
             data["read_sources"]
                 .as_array()
                 .expect("read sources should be an array")
                 .len(),
             7
+        );
+    }
+
+    #[test]
+    fn admin_config_setup_summary_counts_distinct_questions_and_document_overrides() {
+        use crate::admin_config_views::fixtures::{document_access_fixture, user_types_fixture};
+
+        let data = build_admin_setup_summary_tool_data(
+            &admin_config_summary_test_response("instance-settings")["data"],
+            &admin_config_summary_test_response("deployment-settings")["data"],
+            &admin_config_summary_test_response("onboarding-status")["data"],
+            &user_types_fixture(),
+            &document_access_fixture(),
+            &admin_config_summary_test_response("deployment-readiness")["data"],
+            &admin_config_summary_test_response("agent-settings")["data"],
+        );
+
+        // Global questions repeat inside every User Type; count each once.
+        assert_eq!(
+            data["configured"]["onboarding_questions"]["count"],
+            Value::from(175)
+        );
+        assert_eq!(
+            data["configured"]["document_access"],
+            json!({
+                "documents": 200,
+                "default_document_count": 0,
+                "user_types_with_overrides": 4,
+                "user_type_overrides": 16,
+            })
         );
     }
 
@@ -16011,6 +16176,160 @@ mod tests {
             "generated_at": "2026-06-24T00:00:00+00:00",
             "secret_policy": { "mode": "masked" }
         })
+    }
+
+    async fn spawn_large_admin_config_backend() -> (InternalAgentClient, tokio::task::JoinHandle<()>)
+    {
+        use crate::admin_config_views::fixtures::*;
+
+        let app = Router::new().route(
+            "/internal/agent/admin-config/{endpoint}",
+            post(|Path(endpoint): Path<String>| async move {
+                let data = match endpoint.as_str() {
+                    "instance-settings" => instance_settings_fixture(),
+                    "deployment-settings" => deployment_settings_fixture(),
+                    "deployment-readiness" => deployment_readiness_fixture(),
+                    "user-types" => user_types_fixture(),
+                    "document-access" => document_access_fixture(),
+                    "onboarding-status" => onboarding_status_fixture(),
+                    "agent-settings" => agent_settings_fixture(),
+                    other => panic!("unexpected Admin Config endpoint: {}", other),
+                };
+                Json(json!({
+                    "version": 1,
+                    "tool": format!("read_{}", endpoint.replace('-', "_")),
+                    "data": data,
+                    "warnings": [],
+                    "generated_at": "2026-10-23T00:00:00+00:00",
+                    "secret_policy": {"mode": "masked"}
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test backend should bind");
+        let addr = listener.local_addr().expect("test backend address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test backend should serve");
+        });
+        let internal = InternalAgentClient::new(
+            Client::new(),
+            format!("http://{addr}"),
+            "test-token".to_string(),
+        );
+        (internal, server)
+    }
+
+    #[tokio::test]
+    async fn admin_config_reads_fit_the_tool_budget_at_large_scale() {
+        let (internal, server) = spawn_large_admin_config_backend().await;
+        let admin = InternalAuthContext {
+            id: 1,
+            kind: "admin".to_string(),
+            approved: true,
+            pubkey: Some("admin-pubkey".to_string()),
+            email: None,
+            name: None,
+            user_type_id: None,
+            dev_mode: false,
+        };
+        let request = ChatRequest {
+            message: "Read the configuration".to_string(),
+            session_id: None,
+            conversation_surface: None,
+            tools: vec!["admin-config".to_string()],
+            job_ids: None,
+            conversation_channel: None,
+            client_decrypted_context: None,
+        };
+        let (registry, _) = build_conversation_tool_registry(
+            &internal,
+            &Client::new(),
+            &request,
+            &admin,
+            "conversation-budget",
+            4,
+            "http://searxng:8080",
+            None,
+        );
+
+        let cases = [
+            ("read_instance_settings", json!({})),
+            ("read_instance_settings", json!({"keys": ["setting_01"]})),
+            ("read_deployment_settings", json!({})),
+            ("read_deployment_settings", json!({"category": "email"})),
+            ("read_deployment_readiness", json!({})),
+            ("read_agent_settings", json!({})),
+            (
+                "read_agent_settings",
+                json!({"user_type": "Group 1", "keys": ["temperature"]}),
+            ),
+            ("read_user_types", json!({})),
+            ("read_user_types", json!({"user_type": "Group 4"})),
+            ("read_document_access", json!({})),
+            (
+                "read_document_access",
+                json!({"user_type": "Group 3", "document": "Guide 057"}),
+            ),
+            ("read_onboarding_status", json!({})),
+            ("read_admin_setup_summary", json!({})),
+        ];
+        let mut executed = Vec::new();
+        for (name, args) in cases {
+            let tool = registry
+                .get(name)
+                .unwrap_or_else(|| panic!("{} should be registered", name));
+            let args = ToolArgs::from_json_object(&args).expect("args object");
+            let result = tool.execute_native(&args).await.expect("read executes");
+            assert!(
+                result.is_success(),
+                "{} failed: {}",
+                name,
+                result.model_value()
+            );
+            let chars = result.model_value().to_string().chars().count();
+            assert!(
+                chars <= READ_RESULT_BUDGET_CHARS,
+                "{} {:?} returned {} chars",
+                name,
+                args,
+                chars
+            );
+            executed.push(NativeExecutedTool {
+                tool_call: crate::sage_agent::ToolCall {
+                    name: name.to_string(),
+                    args,
+                },
+                result,
+            });
+        }
+
+        let rejected = registry
+            .get("read_document_access")
+            .expect("document access read")
+            .execute_native(&ToolArgs::from([("keys".to_string(), json!(["x"]))]))
+            .await
+            .expect("rejected read returns a Tool failure");
+        server.abort();
+        assert_eq!(rejected.model_value()["error"]["code"], "invalid_arguments");
+
+        for batch in executed.chunks(4) {
+            for content in bounded_native_tool_result_contents(batch) {
+                assert!(!content.contains("__enclave_result_meta"), "{}", content);
+                assert!(!content.contains("result_too_large"), "{}", content);
+            }
+        }
+        let agent = executed[6].result.model_value();
+        assert_eq!(agent["data"]["settings"][0]["value"], "0.3");
+        assert_eq!(agent["data"]["settings"][0]["source"], "user_type_override");
+        let document = executed[10].result.model_value();
+        assert_eq!(document["data"]["page"]["total_count"], 1);
+        assert_eq!(
+            document["data"]["documents"][0]["source"],
+            "user_type_override"
+        );
     }
 
     #[test]
