@@ -866,6 +866,9 @@ fn resource_page_contract_is_consistent(
 #[derive(Clone, Debug, PartialEq, Serialize)]
 struct InternalSessionLogMessage {
     message_id: String,
+    /// Sage's storage-order number; the backend uses it to honour an Admin's
+    /// deletion of the record.
+    sequence_id: i64,
     role: String,
     content: String,
     ts: Option<String>,
@@ -5417,6 +5420,7 @@ fn session_log_record(messages: Vec<StoredMessageRow>) -> Option<SessionLogRecor
             through_sequence_id = through_sequence_id.max(Some(message.sequence_id));
             InternalSessionLogMessage {
                 message_id: message.id.to_string(),
+                sequence_id: message.sequence_id,
                 role: message.role,
                 content: message.content,
                 ts: Some(message.created_at.to_rfc3339()),
@@ -12472,12 +12476,14 @@ mod tests {
             messages: vec![
                 InternalSessionLogMessage {
                     message_id: "22222222-2222-2222-2222-222222222222".to_string(),
+                    sequence_id: 41,
                     role: "user".to_string(),
                     content: "Hello".to_string(),
                     ts: Some("2026-10-23T12:00:00+00:00".to_string()),
                 },
                 InternalSessionLogMessage {
                     message_id: "33333333-3333-3333-3333-333333333333".to_string(),
+                    sequence_id: 42,
                     role: "assistant".to_string(),
                     content: "Hi".to_string(),
                     ts: Some("2026-10-23T12:00:01+00:00".to_string()),
@@ -12515,6 +12521,7 @@ mod tests {
         );
         assert_eq!(payload["messages"][1]["content"], "Hi");
         assert_eq!(payload["through_sequence_id"], 42);
+        assert_eq!(payload["messages"][1]["sequence_id"], 42);
         assert!(payload.get("turns").is_none());
         assert!(payload.get("user_type_id").is_none());
     }
@@ -12576,6 +12583,7 @@ mod tests {
         assert_eq!(record.through_sequence_id, 502);
         assert_eq!(record.messages[0].content, "Question 1");
         assert_eq!(record.messages[1].message_id, first_answer_id);
+        assert_eq!(record.messages[1].sequence_id, 12);
         assert_eq!(
             record.messages[1].ts.as_deref(),
             Some(first_answer_created_at.as_str())
