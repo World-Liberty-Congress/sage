@@ -53,8 +53,12 @@ impl Arguments {
             .parse::<chrono_tz::Tz>()
             .context("timezone must be an IANA timezone")?;
         ensure!(
-            ["user", "day", "model"].contains(&args.group_by.as_str()),
-            "group_by must be user, day, or model"
+            ["total", "user", "day", "model"].contains(&args.group_by.as_str()),
+            "group_by must be total, user, day, or model"
+        );
+        ensure!(
+            args.group_by != "total" || args.cursor.is_none(),
+            "total returns one scope aggregate and does not accept a cursor"
         );
         ensure!(
             (1..=10).contains(&args.limit),
@@ -123,7 +127,7 @@ struct JsonRow {
 const USAGE_SQL: &str = r#"
 WITH base AS MATERIALIZED (
  SELECT m.id, m.role, m.tool_results, s.owner_id, s.id AS session_id,
- CASE $5 WHEN 'user' THEN s.owner_id WHEN 'day' THEN to_char(m.created_at AT TIME ZONE $3, 'YYYY-MM-DD')
+ CASE $5 WHEN 'total' THEN 'total' WHEN 'user' THEN s.owner_id WHEN 'day' THEN to_char(m.created_at AT TIME ZONE $3, 'YYYY-MM-DD')
  ELSE CASE WHEN m.role='assistant' AND m.tool_results->>'model_source'='request'
  AND jsonb_typeof(m.tool_results->'model')='string' AND m.tool_results->>'model'<>''
  THEN 'request:' || (m.tool_results->>'model') ELSE 'unknown' END END AS key
@@ -176,8 +180,10 @@ WITH base AS MATERIALIZED (
  WHERE p.step IS NULL OR p.attempt IS NULL GROUP BY 1
 ), keys AS (
  SELECT key FROM message_groups UNION SELECT key FROM usage_groups UNION SELECT key FROM invalid_groups
+ UNION SELECT 'total' WHERE $5='total'
 )
 SELECT jsonb_build_object('key',k.key,'human_messages',coalesce(m.human_messages,0),
+ 'total_messages',coalesce(m.human_messages,0)+coalesce(m.assistant_messages,0),
  'assistant_messages',coalesce(m.assistant_messages,0),'active_users',coalesce(m.active_users,0),
  'active_conversations',coalesce(m.active_conversations,0),'assistant_with_usage',coalesce(m.assistant_with_usage,0),
  'observations',coalesce(u.observations,0),'observation_records',coalesce(u.observation_records,0),
@@ -225,17 +231,17 @@ impl Tool for UsageTool {
         "read_usage"
     }
     fn description(&self) -> &str {
-        "Read exact retained Sage human/assistant message counts for existing Users, by user, local day, or model. User groups rank by total human+assistant messages descending, ties by numeric User ID ascending: first pages answer top-user questions. Day/model groups sort by key ascending. Supply explicit offset timestamps for [start,end); timezone defaults UTC. Admin tests excluded unless explicitly included. Deleted Sage sessions and deleted Users excluded; encrypted review-log retention is separate. Continue next_cursor with identical filters; pages are live, not a cross-store snapshot. Model keys request:* name requested models, never provider-confirmed; human/historical missing models are unknown. Tokens and token_coverage arrays follow token_fields (prompt,completion,total): sums of known values and number of observations containing each field, null when none. Observations deduplicate per assistant record/step/attempt; retries are distinct requests. observation_records counts records with keyed observations; assistant_with_usage counts records with any valid token value. Always report assistant-message token coverage as assistant_with_usage of assistant_messages (for example 13 of 25 assistant messages); token_coverage is per-field observation counts, not the message-coverage denominator. For zero assistant messages, message coverage is not applicable. Conflicts discard ambiguous tokens; invalid_observations lack attempt identity. Model token groups use observation models separately from message models; active counts and records overlap across groups. No cost without versioned prices. Whole rows fit 1200 UTF-8 bytes."
+        "Read exact retained Sage message counts for existing Users across the total scope or by user, local day, or model. For scope-wide totals, call group_by=total with the same interval/timezone/test filters and quote its total_messages, human_messages, assistant_messages and observed tokens directly; do not sum grouped pages. Total covers all eligible Users in the scope, returns one row even when empty, and has no cursor. Every aggregate row includes total_messages (human plus assistant). Empty scopes have zero message counts and null token sums. User groups rank by total human+assistant messages descending, ties by numeric User ID ascending: first pages answer top-user questions. Day/model groups sort by key ascending. Supply explicit offset timestamps for [start,end); timezone defaults UTC. Admin tests excluded unless explicitly included. Deleted Sage sessions and deleted Users excluded; encrypted review-log retention is separate. Continue next_cursor with identical filters; pages are live, not a cross-store snapshot. Model keys request:* name requested models, never provider-confirmed; human/historical missing models are unknown. Tokens and token_coverage arrays follow token_fields (prompt,completion,total): sums of known values and number of observations containing each field, null when none. Observations deduplicate per assistant record/step/attempt; retries are distinct requests. observation_records counts records with keyed observations; assistant_with_usage counts records with any valid token value. Always report assistant-message token coverage as assistant_with_usage of assistant_messages (for example 13 of 25 assistant messages); token_coverage is per-field observation counts, not the message-coverage denominator. For zero assistant messages, message coverage is not applicable. Conflicts discard ambiguous tokens; invalid_observations lack attempt identity. Model token groups use observation models separately from message models; active counts and records overlap across groups. No cost without versioned prices. Whole rows fit 1200 UTF-8 bytes."
     }
     fn native_parameters(&self) -> Result<Value> {
         Ok(json!({"type":"object","properties":{
             "start":{"type":"string","description":"Inclusive RFC3339 timestamp with explicit UTC offset."},
             "end":{"type":"string","description":"Exclusive RFC3339 timestamp with explicit UTC offset."},
             "timezone":{"type":"string","description":"IANA timezone for local-day buckets; default UTC."},
-            "group_by":{"type":"string","enum":["user","day","model"],"description":"Default day. User: total message count descending, numeric User ID ascending on ties. Day/model: key ascending."},
+            "group_by":{"type":"string","enum":["total","user","day","model"],"description":"Use total for exact scope-wide counts and tokens in one row, including an empty scope; do not sum grouped pages for scope totals. Default day. User: total_messages descending, numeric User ID ascending on ties. Day/model: key ascending."},
             "include_admin_tests":{"type":"boolean","description":"Explicitly include provisioned Admin test Users; default false."},
             "limit":{"type":"integer","minimum":1,"maximum":10,"description":"Maximum groups; default 1. Byte budget may return fewer."},
-            "cursor":{"type":"string","description":"next_cursor from prior page; retain all filters."}
+            "cursor":{"type":"string","description":"next_cursor from prior grouped page; retain all filters. Omit for total."}
         },"required":["start","end"],"additionalProperties":false}))
     }
     async fn execute_native(&self, args: &ToolArgs) -> Result<NativeToolResult> {
@@ -467,8 +473,8 @@ fn query_usage_with_connection(
         "source":"retained_sage_messages/current_users",
         "start":args.start,"end":args.end,"interval":"[start,end)","timezone":args.timezone,
         "group_by":args.group_by,"include_admin_tests":args.include_admin_tests,
-        "order":if args.group_by=="user" {"messages_desc,user_id_asc"} else {"key_asc"},
-        "coverage":"live; messages exact; assistant coverage=assistant_with_usage/assistant_messages; token_coverage=per-field observations; groups overlap",
+        "order":match args.group_by.as_str() {"user"=>"messages_desc,user_id_asc","total"=>"single_scope",_=>"key_asc"},
+        "coverage":"live; messages exact; assistant coverage=assistant_with_usage/assistant_messages; token_coverage=per-field observations",
         "token_fields":["prompt","completion","total"],
         "cost":"unavailable:no_versioned_prices","rows":[],"next_cursor":null
     });
@@ -476,15 +482,9 @@ fn query_usage_with_connection(
         let key = row["key"].as_str().context("invalid usage group")?;
         let prior = result.clone();
         result["rows"].as_array_mut().unwrap().push(row.clone());
-        let count = row["human_messages"]
+        let count = row["total_messages"]
             .as_i64()
-            .context("invalid message count")?
-            .checked_add(
-                row["assistant_messages"]
-                    .as_i64()
-                    .context("invalid message count")?,
-            )
-            .context("message count overflow")?;
+            .context("invalid total message count")?;
         result["next_cursor"] = if index + 1 < rows.len() {
             json!(args.cursor_for(key, count))
         } else {

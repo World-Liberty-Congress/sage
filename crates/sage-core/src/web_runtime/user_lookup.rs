@@ -1127,6 +1127,10 @@ mod tests {
             json!({"select":["name"]}),
             json!({"user_ids":[1,1]}),
             json!({"start":"2026-10-20"}),
+            json!({"start":"2026-10-20T10:00:00.000001000Z"}),
+            json!({"start":"2026-10-20t10:00:00Z"}),
+            json!({"start":"2026-10-20T10:00:60Z"}),
+            json!({"end":"2026-10-20T10:00:00.0000001+00:00"}),
             json!({"source":"raw_sage"}),
             json!({"cursor":null}),
         ] {

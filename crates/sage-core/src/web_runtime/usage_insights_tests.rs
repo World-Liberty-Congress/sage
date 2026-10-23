@@ -44,6 +44,7 @@ fn retained_counts_use_half_open_utc_interval_and_local_calendar_day() {
         assert_eq!(result["rows"][0]["key"], "2026-03-08");
         assert_eq!(result["rows"][0]["human_messages"], 1);
         assert_eq!(result["rows"][0]["assistant_messages"], 1);
+        assert_eq!(result["rows"][0]["total_messages"], 2);
         assert_eq!(result["rows"][0]["active_users"], 1);
         assert_eq!(result["rows"][0]["active_conversations"], 1);
         assert_eq!(result["rows"][0]["tokens"], json!([null, null, null]));
@@ -51,6 +52,87 @@ fn retained_counts_use_half_open_utc_interval_and_local_calendar_day() {
         assert_eq!(result["rows"][0]["assistant_with_usage"], 0);
         assert!(result["next_cursor"].is_null());
         assert!(serde_json::to_vec(&result).unwrap().len() <= 1200);
+    });
+}
+
+#[test]
+fn total_scope_returns_one_exact_aggregate_including_a_validated_empty_scope() {
+    with_database(|conn| {
+        let mut args = arguments();
+        args["group_by"] = json!("total");
+        for (owners, total, human, assistant) in
+            [(vec!["1".into()], 2, 1, 1), (Vec::<String>::new(), 0, 0, 0)]
+        {
+            let result = query_usage(conn, &args, &owners).unwrap();
+            assert_eq!(result["rows"].as_array().unwrap().len(), 1);
+            let row = &result["rows"][0];
+            assert_eq!(row["key"], "total");
+            assert_eq!(row["total_messages"], total);
+            assert_eq!(row["human_messages"], human);
+            assert_eq!(row["assistant_messages"], assistant);
+            assert_eq!(row["tokens"], json!([null, null, null]));
+            assert_eq!(row["token_coverage"], json!([0, 0, 0]));
+            assert!(result["next_cursor"].is_null());
+            assert!(serde_json::to_vec(&result).unwrap().len() <= 1200);
+        }
+        args["start"] = json!("2027-01-01T00:00:00Z");
+        args["end"] = json!("2027-01-02T00:00:00Z");
+        let empty = query_usage(conn, &args, &["1".into()]).unwrap();
+        assert_eq!(empty["rows"][0]["total_messages"], 0);
+        assert_eq!(empty["rows"][0]["active_users"], 0);
+        assert_eq!(empty["rows"][0]["active_conversations"], 0);
+        args["cursor"] = json!("unsupported");
+        assert!(query_usage(conn, &args, &["1".into()]).is_err());
+    });
+}
+
+#[test]
+fn total_scope_fixture_reports_150_messages_585_tokens_and_39_of_75_assistants() {
+    with_database(|conn| {
+        conn.batch_execute(r#"
+        DELETE FROM messages;
+        DELETE FROM web_sessions;
+        INSERT INTO web_sessions SELECT md5('session'||n)::uuid,md5('agent'||n)::uuid,'user',(995+n)::text
+        FROM generate_series(1,5) n;
+        INSERT INTO messages SELECT md5('message'||n||':'||j||':'||r.role)::uuid,
+        md5('agent'||n)::uuid,'user:'||(995+n),r.role,
+        CASE WHEN r.role='user' THEN '2001-01-01T12:00:00Z'::timestamptz
+             ELSE '2001-01-02T12:00:00Z'::timestamptz END,
+        CASE WHEN r.role='assistant' THEN jsonb_build_object('model','fixture-model','model_source','request',
+          'conversation_trace',jsonb_build_object('trace_deltas',CASE WHEN j%2=1 THEN '[
+            {"kind":"timing","title":"Model usage","metadata":{"step":0,"attempt":0,"model":"fixture-model","model_source":"request","prompt_tokens":10,"completion_tokens":5,"total_tokens":15}},
+            {"kind":"timing","title":"Model usage","metadata":{"step":0,"attempt":0,"model":"fixture-model","model_source":"request","prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}
+          ]'::jsonb ELSE '[]'::jsonb END)) ELSE NULL END
+        FROM generate_series(1,5) n CROSS JOIN LATERAL generate_series(1,n*5) j
+        CROSS JOIN (VALUES ('user'),('assistant')) r(role);
+        "#).unwrap();
+        let owners = (996..=1000).map(|id| id.to_string()).collect::<Vec<_>>();
+        let mut args = json!({"start":"2001-01-01T00:00:00Z","end":"2001-01-04T00:00:00Z",
+            "timezone":"UTC","group_by":"total"});
+        let result = query_usage(conn, &args, &owners).unwrap();
+        assert_eq!(result["rows"].as_array().unwrap().len(), 1);
+        let row = &result["rows"][0];
+        assert_eq!(row["total_messages"], 150);
+        assert_eq!(row["human_messages"], 75);
+        assert_eq!(row["assistant_messages"], 75);
+        assert_eq!(row["active_users"], 5);
+        assert_eq!(row["active_conversations"], 5);
+        assert_eq!(row["assistant_with_usage"], 39);
+        assert_eq!(row["observation_records"], 39);
+        assert_eq!(row["observations"], 39);
+        assert_eq!(row["duplicates"], 39);
+        assert_eq!(row["tokens"], json!([390, 195, 585]));
+        assert_eq!(row["token_coverage"], json!([39, 39, 39]));
+        assert!(result["next_cursor"].is_null());
+        assert!(serde_json::to_vec(&result).unwrap().len() <= 1200);
+
+        args["group_by"] = json!("user");
+        let ranked = query_usage(conn, &args, &owners).unwrap();
+        assert_eq!(ranked["rows"][0]["total_messages"], 50);
+        args["group_by"] = json!("model");
+        let model = query_usage(conn, &args, &owners).unwrap();
+        assert_eq!(model["rows"][0]["key"], "request:fixture-model");
+        assert_eq!(model["rows"][0]["total_messages"], 75);
     });
 }
 
@@ -311,6 +393,13 @@ fn execution_excludes_admin_tests_and_deleted_users_by_live_classifier() {
         };
         let mut args = arguments();
         args["include_admin_tests"] = json!(include);
+        args["group_by"] = json!("total");
+        assert!(
+            tool.native_parameters().unwrap()["properties"]["group_by"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("total"))
+        );
         let NativeToolResult::Success(result) = runtime
             .block_on(tool.execute_native(&tool_arguments(args)))
             .unwrap()
@@ -365,6 +454,7 @@ fn empty_data_still_requires_live_admin_and_foreign_or_duplicate_owners_fail_clo
     let mut args = arguments();
     args["start"] = json!("2027-01-01T00:00:00Z");
     args["end"] = json!("2027-01-02T00:00:00Z");
+    args["group_by"] = json!("total");
     assert!(matches!(
         runtime
             .block_on(tool.execute_native(&tool_arguments(args)))

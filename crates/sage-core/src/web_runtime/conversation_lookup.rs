@@ -23,9 +23,28 @@ struct Arguments {
 }
 const MAX_ID: u64 = 9_007_199_254_740_991;
 fn utc(value: &str) -> bool {
-    value.len() <= 40
-        && (value.ends_with('Z') || value.ends_with("+00:00"))
-        && chrono::DateTime::parse_from_rfc3339(value).is_ok()
+    // Match the browser's uppercase, microsecond UTC grammar before dispatch.
+    // A wider Chrono parse would send requests the browser rejects mid-stream.
+    let Some(body) = value
+        .strip_suffix('Z')
+        .or_else(|| value.strip_suffix("+00:00"))
+    else {
+        return false;
+    };
+    let (seconds, fraction) = body
+        .split_once('.')
+        .map_or((body, None), |(s, f)| (s, Some(f)));
+    if value.len() > 40
+        || seconds.len() != 19
+        || fraction
+            .is_some_and(|f| f.is_empty() || f.len() > 6 || !f.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return false;
+    }
+    chrono::DateTime::parse_from_rfc3339(value).is_ok_and(|parsed| {
+        parsed.timestamp_subsec_nanos() < 1_000_000_000
+            && parsed.format("%Y-%m-%dT%H:%M:%S").to_string() == seconds
+    })
 }
 fn token(value: &str) -> bool {
     Uuid::parse_str(value).is_ok_and(|id| id.to_string() == value.to_lowercase())
@@ -75,8 +94,8 @@ pub(super) fn parse_arguments(value: Value) -> Option<Value> {
 pub(super) fn parameters() -> Value {
     json!({"type":"object","additionalProperties":false,"properties":{
         "user_ids":{"type":"array","items":{"type":"integer","minimum":1,"maximum":MAX_ID},"minItems":1,"maxItems":20,"uniqueItems":true},
-        "start":{"type":"string","description":"Inclusive UTC RFC3339 message timestamp; legacy unknown times are reported."},
-        "end":{"type":"string","description":"Exclusive UTC RFC3339 message timestamp."},
+        "start":{"type":"string","description":"Inclusive UTC message timestamp: YYYY-MM-DDTHH:MM:SS with optional 1–6 fractional digits and Z or +00:00. Legacy unknown times are reported."},
+        "end":{"type":"string","description":"Exclusive UTC message timestamp: YYYY-MM-DDTHH:MM:SS with optional 1–6 fractional digits and Z or +00:00."},
         "feedback":{"type":"string","enum":["up","down","any","none"]},
         "source":{"type":"string","enum":["user","admin_test","all"],"default":"user"},
         "select":{"type":"string","enum":["transcript","feedback","both"],"default":"both"},
@@ -305,6 +324,26 @@ pub(super) fn register(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn conversation_lookup_timestamp_grammar_matches_browser() {
+        for value in [
+            "2026-10-20T10:00:00Z",
+            "2026-10-20T10:00:00.1Z",
+            "2026-10-20T10:00:00.000001+00:00",
+        ] {
+            assert!(parse_arguments(json!({"start":value})).is_some(), "{value}");
+        }
+        for value in [
+            "2026-10-20T10:00:00.000001000Z",
+            "2026-10-20t10:00:00Z",
+            "2026-10-20T10:00:60Z",
+            "2026-02-30T10:00:00Z",
+            "2026-10-20T10:00:00.Z",
+            "2026-10-20T10:00:00+01:00",
+        ] {
+            assert!(parse_arguments(json!({"start":value})).is_none(), "{value}");
+        }
+    }
     #[test]
     fn conversation_lookup_registration_requires_live_admin_database_capability() {
         for (kind, enabled, capability, fingerprint, approved) in [
