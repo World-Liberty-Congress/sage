@@ -38,6 +38,8 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
+mod agent_settings_writes;
+
 use crate::admin_config_views::{
     agent_settings_view, AgentSetting, AgentSettingOverride, AgentSettingsSnapshot, ReadView,
     ReadViewError, UserTypeAgentOverrides, READ_RESULT_BUDGET_CHARS,
@@ -58,6 +60,7 @@ use crate::schema::{
     agents, ai_config, ai_config_user_type_overrides, blocks, external_identities, messages,
     passages, scheduled_tasks, summaries, user_preferences, web_sessions,
 };
+use agent_settings_writes::{AdminAgentSettingsWriteTool, AdminConfigureInstanceTool};
 
 const DEFAULT_PREVIEW_QUESTION: &str = "What should I know about this topic?";
 const ADMIN_CONFIG_TOOL_SET_ID: &str = "admin-config";
@@ -2547,12 +2550,23 @@ fn build_conversation_tool_registry_with_context(
                 traces: sinks.traces.clone(),
             }));
         }
+        registry.register(Arc::new(AdminConfigureInstanceTool {
+            internal: internal.clone(),
+            state: state.cloned(),
+            auth: auth.clone(),
+            conversation_id: conversation_id.to_string(),
+            traces: sinks.traces.clone(),
+            affected_areas: sinks.admin_config_affected_areas.clone(),
+        }));
+        registry.register(Arc::new(AdminAgentSettingsWriteTool {
+            internal: internal.clone(),
+            state: state.cloned(),
+            auth: auth.clone(),
+            conversation_id: conversation_id.to_string(),
+            traces: sinks.traces.clone(),
+            affected_areas: sinks.admin_config_affected_areas.clone(),
+        }));
         for (name, endpoint, description) in [
-            (
-                "configure_instance",
-                "configure-instance",
-                "Apply the complete guided first-setup configuration atomically after the Admin confirms it conversationally.",
-            ),
             (
                 "update_instance_settings",
                 "update-instance-settings",
@@ -2562,11 +2576,6 @@ fn build_conversation_tool_registry_with_context(
                 "update_deployment_settings",
                 "update-deployment-settings",
                 "Update one or more Deployment Settings atomically. Reports restart requirements but never restarts services.",
-            ),
-            (
-                "update_agent_settings",
-                "update-agent-settings",
-                "Update global or User-Type-specific Agent Settings, or revert User-Type overrides, atomically.",
             ),
             (
                 "manage_user_types",
@@ -3305,16 +3314,6 @@ fn build_admin_config_direct_payload(tool_name: &str, args: &ToolArgs) -> Result
         "update_instance_settings" | "update_deployment_settings" => Ok(json!({
             "settings": object_arg(args, "settings", true)?,
         })),
-        "update_agent_settings" => {
-            let mut payload = serde_json::Map::from_iter([
-                ("updates".to_string(), object_arg(args, "updates", false)?),
-                ("revert_keys".to_string(), array_arg(args, "revert_keys")?),
-            ]);
-            if let Some(value) = optional_i64_arg(args, "user_type_id")? {
-                payload.insert("user_type_id".to_string(), Value::from(value));
-            }
-            Ok(Value::Object(payload))
-        }
         "manage_user_types" => {
             let mut payload = serde_json::Map::new();
             payload.insert(
@@ -3486,8 +3485,8 @@ fn admin_config_direct_native_parameters(tool_name: &str) -> Result<Value> {
                             "additionalProperties": false
                         }
                     },
-                    "behavior_rules": {"type": "array", "maxItems": 8, "items": {"type": "string", "minLength": 1}},
-                    "forbidden_topics": {"type": "array", "maxItems": 8, "items": {"type": "string", "minLength": 1}}
+                    "behavior_rules": {"type": "array", "maxItems": 8, "items": {"type": "string", "minLength": 1}, "description": "Operator behavior rules. Leave empty to keep the current rules."},
+                    "forbidden_topics": {"type": "array", "maxItems": 8, "items": {"type": "string", "minLength": 1}, "description": "Topics to avoid. Leave empty to keep the current list."}
                 },
                 "required": ["settings", "user_types", "onboarding_questions", "behavior_rules", "forbidden_topics"],
                 "additionalProperties": false
@@ -3640,66 +3639,81 @@ impl Tool for AdminConfigDirectTool {
             Err(error) => return Ok(admin_config_native_failure(error)),
         };
 
-        let data = &response.data;
-        let changed_names = data
-            .get("changed_names")
-            .and_then(Value::as_array)
-            .map(|values| {
-                values
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let affected_areas = data
-            .get("affected_areas")
-            .and_then(Value::as_array)
-            .map(|values| {
-                values
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        if let Ok(mut sink) = self.affected_areas.lock() {
-            for area in affected_areas {
-                if !sink.contains(&area) {
-                    sink.push(area);
-                }
+        Ok(admin_config_direct_result(
+            &self.name,
+            response,
+            &self.traces,
+            &self.affected_areas,
+        ))
+    }
+}
+
+/// Reports a direct Admin Config write: records its affected areas for the
+/// client refresh and its outcome for Activity, and returns the result.
+fn admin_config_direct_result(
+    name: &str,
+    response: InternalAdminConfigToolResponse,
+    traces: &Arc<Mutex<Vec<ToolCallInfoResponse>>>,
+    affected_areas: &Arc<Mutex<Vec<String>>>,
+) -> NativeToolResult {
+    let data = &response.data;
+    let changed_names = data
+        .get("changed_names")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let areas = data
+        .get("affected_areas")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if let Ok(mut sink) = affected_areas.lock() {
+        for area in areas {
+            if !sink.contains(&area) {
+                sink.push(area);
             }
         }
-        let outcome = data
-            .get("outcome")
-            .and_then(Value::as_str)
-            .unwrap_or("succeeded");
-        let changed_summary = if changed_names.is_empty() {
-            "No configuration values changed.".to_string()
-        } else {
-            format!("Changed: {}.", changed_names.join(", "))
-        };
-        let warnings = response.warnings.clone();
-        if let Ok(mut sink) = self.traces.lock() {
-            sink.push(ToolCallInfoResponse {
-                tool_id: format!("admin-config:{}", self.name),
-                tool_name: "Admin Config".to_string(),
-                query: Some(self.name.clone()),
-                output_summary: Some(format!("{}: {} {}", self.name, outcome, changed_summary)),
-                warnings,
-                metadata: json!({}),
-                guarded: false,
-            });
-        }
-        Ok(NativeToolResult::success(json!({
-            "version": response.version,
-            "tool": response.tool,
-            "generated_at": response.generated_at,
-            "secret_policy": response.secret_policy,
-            "warnings": response.warnings,
-            "data": response.data,
-        })))
     }
+    let outcome = data
+        .get("outcome")
+        .and_then(Value::as_str)
+        .unwrap_or("succeeded");
+    let changed_summary = if changed_names.is_empty() {
+        "No configuration values changed.".to_string()
+    } else {
+        format!("Changed: {}.", changed_names.join(", "))
+    };
+    if let Ok(mut sink) = traces.lock() {
+        sink.push(ToolCallInfoResponse {
+            tool_id: format!("admin-config:{}", name),
+            tool_name: "Admin Config".to_string(),
+            query: Some(name.to_string()),
+            output_summary: Some(format!("{}: {} {}", name, outcome, changed_summary)),
+            warnings: response.warnings.clone(),
+            metadata: json!({}),
+            guarded: false,
+        });
+    }
+    NativeToolResult::success(json!({
+        "version": response.version,
+        "tool": response.tool,
+        "generated_at": response.generated_at,
+        "secret_policy": response.secret_policy,
+        "warnings": response.warnings,
+        "data": response.data,
+    }))
 }
 
 #[async_trait::async_trait]
