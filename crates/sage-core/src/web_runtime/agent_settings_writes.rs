@@ -10,10 +10,8 @@ use super::*;
 
 const RECORD_ENDPOINT: &str = "record-agent-settings-change";
 const MAX_GUIDED_RULES: usize = 8;
-const AUDIT_UNAVAILABLE: &str =
-    "Agent Settings were not changed because the change could not be recorded in the Audit Log. Try again.";
-const ROLLBACK_INCOMPLETE: &str =
-    "Agent Settings may still include this change: it could not be recorded in the Audit Log, and rolling it back did not complete. Read the Agent Settings before retrying.";
+const AUDIT_UNAVAILABLE: &str = "Agent Settings were not changed because the change could not be recorded in the Audit Log. Try again.";
+const ROLLBACK_INCOMPLETE: &str = "Agent Settings may still include this change: it could not be recorded in the Audit Log, and rolling it back did not complete. Read the Agent Settings before retrying.";
 
 /// One requested change within a single scope (global or one User Type).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -333,8 +331,8 @@ fn restore_agent_setting_changes(
     match restored {
         Ok(false) => Rollback::Restored,
         Ok(true) => Rollback::Superseded,
-        Err(error) => {
-            warn!("Agent Settings rollback failed: {}", error);
+        Err(_) => {
+            warn!("Agent Settings rollback failed");
             Rollback::Failed
         }
     }
@@ -400,6 +398,61 @@ pub(super) async fn record_agent_settings_change(
         .map(|_| ())
 }
 
+/// Admin AI Config HTTP writes share the agent's audited mutation and conditional rollback.
+pub(super) async fn apply_admin_ui_setting_write(
+    state: &WebAppState,
+    auth: &InternalAuthContext,
+    user_type_id: Option<i32>,
+    key: &str,
+    value: Option<&str>,
+) -> AppResult<()> {
+    if auth.kind != "admin" || !auth.approved || auth.pubkey.as_deref().is_none_or(str::is_empty) {
+        return Err(AppError::new(
+            StatusCode::FORBIDDEN,
+            "Approved Admin access required",
+        ));
+    }
+    let existing = load_ai_config_row(state, key)?;
+    let write = if let Some(value) = value {
+        validate_ai_config_value(key, &existing.value_type, &existing.category, value)?;
+        AgentSettingWrite::Set {
+            key: key.to_string(),
+            value: value.to_string(),
+        }
+    } else if user_type_id.is_some() {
+        AgentSettingWrite::Revert {
+            key: key.to_string(),
+        }
+    } else {
+        return Err(AppError::new(
+            StatusCode::BAD_REQUEST,
+            "Global Agent Settings cannot be reverted",
+        ));
+    };
+    apply_and_record(
+        state,
+        &state.internal,
+        auth,
+        "",
+        "admin_ui_update_agent_settings",
+        user_type_id,
+        &[write],
+    )
+    .await
+    .map(|_| ())
+    .map_err(|result| match result {
+        NativeToolResult::Failure { code, message } => AppError::new(
+            if code == "unauthorized" {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::BAD_GATEWAY
+            },
+            message,
+        ),
+        _ => AppError::internal("Agent Settings change failed"),
+    })
+}
+
 /// Applies writes, records them, and rolls them back if recording fails.
 async fn apply_and_record(
     state: &WebAppState,
@@ -424,10 +477,8 @@ async fn apply_and_record(
     {
         Ok(()) => Ok(changes),
         Err(error) => {
-            warn!(
-                "Agent Settings audit record failed; rolling back: {:?}",
-                error
-            );
+            // Upstream validation/database errors can contain submitted values.
+            warn!("Agent Settings audit record failed; rolling back");
             Err(
                 match restore_agent_setting_changes(state, user_type_id, &changes) {
                     Rollback::Restored => match error {
@@ -620,7 +671,7 @@ impl Tool for AdminConfigureInstanceTool {
                 return Ok(NativeToolResult::failure(
                     "invalid_arguments",
                     error.to_string(),
-                ))
+                ));
             }
         };
         let (writes, saved_rules) = match take_guided_agent_settings(&mut payload) {
@@ -680,8 +731,12 @@ impl Tool for AdminConfigureInstanceTool {
                 error
             );
             let message = match restore_agent_setting_changes(state, None, &changes) {
-                Rollback::Restored => "Instance Settings, User Types, and Onboarding Questions were saved, but behavior rules and forbidden topics were not, because that change could not be recorded in the Audit Log. Retry them with update_agent_settings.",
-                Rollback::Superseded | Rollback::Failed => "Instance Settings, User Types, and Onboarding Questions were saved. Behavior rules and forbidden topics could not be recorded in the Audit Log, and rolling them back did not complete. Read the Agent Settings before retrying.",
+                Rollback::Restored => {
+                    "Instance Settings, User Types, and Onboarding Questions were saved, but behavior rules and forbidden topics were not, because that change could not be recorded in the Audit Log. Retry them with update_agent_settings."
+                }
+                Rollback::Superseded | Rollback::Failed => {
+                    "Instance Settings, User Types, and Onboarding Questions were saved. Behavior rules and forbidden topics could not be recorded in the Audit Log, and rolling them back did not complete. Read the Agent Settings before retrying."
+                }
             };
             // The control-plane part is committed: refresh its areas and show it.
             if let Some(object) = response.data.as_object_mut() {
