@@ -2,6 +2,7 @@
 //!
 //! Shared types and modules for the Sage AI agent.
 
+mod admin_config_views;
 pub mod agent_manager;
 pub mod config;
 pub mod marmot;
