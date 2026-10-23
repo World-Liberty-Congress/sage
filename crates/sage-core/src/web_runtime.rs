@@ -249,9 +249,21 @@ pub struct WebAppState {
     pub internal: InternalAgentClient,
 }
 
+/// The Python control plane (uvicorn) closes keep-alive connections that sit
+/// idle for five seconds. Dropping pooled connections sooner means Sage never
+/// sends a request on a connection the backend is closing, which fails that
+/// request with "error sending request" partway through a turn.
+const BACKEND_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(4);
+
+fn backend_http_client(pool_idle_timeout: Duration) -> reqwest::Result<Client> {
+    Client::builder()
+        .pool_idle_timeout(pool_idle_timeout)
+        .build()
+}
+
 pub fn build_router(config: Config, web_config: EnclaveWebConfig) -> Result<Router> {
     let db_conn = PgConnection::establish(&config.database_url)?;
-    let http = Client::builder().build()?;
+    let http = backend_http_client(BACKEND_POOL_IDLE_TIMEOUT)?;
     let internal = InternalAgentClient::new(
         http.clone(),
         web_config.backend_url.clone(),
@@ -12203,6 +12215,50 @@ mod tests {
         assert_eq!(summary["results"][0]["target_kind"], "session_memory");
         assert_eq!(summary["results"][0]["action"], "delete_messages");
         assert_eq!(summary["results"][0]["status"], "succeeded");
+    }
+
+    #[tokio::test]
+    async fn backend_client_does_not_reuse_connections_past_the_idle_limit() {
+        use axum::serve::ListenerExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // A keep-alive server that counts the TCP connections it accepts.
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = accepted.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test backend should bind");
+        let addr = listener
+            .local_addr()
+            .expect("test backend should expose local addr");
+        let listener = listener.tap_io(move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+        let app = Router::new().route("/health", get(|| async { "ok" }));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test backend should serve");
+        });
+        let url = format!("http://{}/health", addr);
+
+        let client =
+            backend_http_client(Duration::from_millis(100)).expect("backend client should build");
+        client.get(&url).send().await.expect("first request");
+        client.get(&url).send().await.expect("immediate request");
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "a busy connection is reused"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        client.get(&url).send().await.expect("request after idling");
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            2,
+            "an idle connection is not reused past the limit"
+        );
+        server.abort();
     }
 
     #[tokio::test]
