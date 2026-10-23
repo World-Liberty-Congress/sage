@@ -16,6 +16,7 @@ use base64::{
     engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD},
     Engine as _,
 };
+use chrono::SubsecRound;
 use diesel::prelude::*;
 use diesel::sql_types::{Integer, Nullable, Text, Timestamptz, Uuid as SqlUuid, Varchar};
 use flate2::read::ZlibDecoder;
@@ -50,8 +51,8 @@ use crate::sage_agent::{
     ToolExecutionError, ToolRegistry, ToolRetryPolicy,
 };
 use crate::schema::{
-    agents, ai_config, ai_config_user_type_overrides, blocks, messages, passages, scheduled_tasks,
-    summaries, user_preferences, web_sessions,
+    agents, ai_config, ai_config_user_type_overrides, blocks, external_identities, messages,
+    passages, scheduled_tasks, summaries, user_preferences, web_sessions,
 };
 
 const DEFAULT_PREVIEW_QUESTION: &str = "What should I know about this topic?";
@@ -248,9 +249,21 @@ pub struct WebAppState {
     pub internal: InternalAgentClient,
 }
 
+/// The Python control plane (uvicorn) closes keep-alive connections that sit
+/// idle for five seconds. Dropping pooled connections sooner means Sage never
+/// sends a request on a connection the backend is closing, which fails that
+/// request with "error sending request" partway through a turn.
+const BACKEND_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(4);
+
+fn backend_http_client(pool_idle_timeout: Duration) -> reqwest::Result<Client> {
+    Client::builder()
+        .pool_idle_timeout(pool_idle_timeout)
+        .build()
+}
+
 pub fn build_router(config: Config, web_config: EnclaveWebConfig) -> Result<Router> {
     let db_conn = PgConnection::establish(&config.database_url)?;
-    let http = Client::builder().build()?;
+    let http = backend_http_client(BACKEND_POOL_IDLE_TIMEOUT)?;
     let internal = InternalAgentClient::new(
         http.clone(),
         web_config.backend_url.clone(),
@@ -265,6 +278,9 @@ pub fn build_router(config: Config, web_config: EnclaveWebConfig) -> Result<Rout
         internal,
     };
     seed_default_ai_config(&state).map_err(|error| anyhow!(error.message.clone()))?;
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        runtime.spawn(retry_pending_session_logs(state.clone()));
+    }
     let cors = build_cors_layer(&web_config)?;
 
     Ok(Router::new()
@@ -418,8 +434,6 @@ pub struct ChatRequest {
     #[serde(default)]
     pub tools: Vec<String>,
     #[serde(default)]
-    pub conversation_history: Vec<ChatHistoryMessage>,
-    #[serde(default)]
     pub job_ids: Option<Vec<String>>,
     #[serde(default)]
     pub conversation_channel: Option<ConversationChannelRequest>,
@@ -432,12 +446,6 @@ pub struct ConversationChannelRequest {
     pub kind: String,
     #[serde(default)]
     pub delivery: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ChatHistoryMessage {
-    pub role: String,
-    pub content: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -848,19 +856,22 @@ fn resource_page_contract_is_consistent(
         && response.next_offset == expected_next_offset
 }
 
-#[derive(Clone, Debug, Serialize)]
-struct InternalSessionLogTurn {
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct InternalSessionLogMessage {
+    message_id: String,
     role: String,
     content: String,
     ts: Option<String>,
 }
 
+/// The Admin review record of one User Conversation: its complete retained
+/// user and assistant history, oldest first.
 #[derive(Clone, Debug, Serialize)]
 struct InternalSessionLogRequest {
     actor: InternalAuthContext,
-    turns: Vec<InternalSessionLogTurn>,
-    sage_session_id: Option<String>,
-    user_type_id: Option<i32>,
+    messages: Vec<InternalSessionLogMessage>,
+    through_sequence_id: i64,
+    sage_session_id: String,
     title: Option<String>,
 }
 
@@ -1263,6 +1274,7 @@ impl InternalAgentClient {
         let request = self
             .http
             .post(format!("{}/internal/agent/session-logs", self.backend_url))
+            .timeout(SESSION_LOG_REQUEST_TIMEOUT)
             .header("X-Internal-Agent-Token", &self.internal_agent_token)
             .json(payload);
         self.send_json(request).await
@@ -4093,6 +4105,7 @@ async fn chat(
 
     let session = get_or_create_web_session(&state, request.session_id.as_deref(), &auth)?;
     update_session_last_question(&state, session.id, &request.message)?;
+    mark_user_session_log_pending(&state, &auth, session.id);
 
     let mut profile = HashMap::new();
     if auth.kind != "admin" && auth.id != -1 {
@@ -4120,6 +4133,7 @@ async fn chat(
     memory
         .store_message_deferred(&memory_user_id, "user", &request.message)
         .map_err(internal_error)?;
+    mark_user_session_log_pending(&state, &auth, session.id);
 
     let top_k = value_as_i32(ai_config.parameters.get("top_k"), 4);
     let (registry, tool_sinks) = build_conversation_tool_registry(
@@ -4184,13 +4198,7 @@ async fn chat(
             );
         }
     }
-    persist_user_session_log(
-        &state.internal,
-        &auth,
-        session.id,
-        chat_request_session_log_turns(&request, &response_text),
-    )
-    .await;
+    record_user_session_log(&state, &auth, &session).await;
 
     Ok(Json(ChatResponse {
         message: response_text,
@@ -4376,6 +4384,7 @@ async fn chat_stream(
     lm_settings.configure_authoritative().await?;
     let session = get_or_create_web_session(&state, request.session_id.as_deref(), &auth)?;
     update_session_last_question(&state, session.id, &request.message)?;
+    mark_user_session_log_pending(&state, &auth, session.id);
     let message_id = format!("msg_{}", Uuid::new_v4().simple());
     let session_id = Some(session.id.to_string());
 
@@ -4442,6 +4451,7 @@ async fn chat_stream(
         if let Err(error) = memory.store_message_with_compaction_check(&memory_user_id, "user", &request.message).await {
             warn!("failed to persist streamed user message for session {}: {}", session.id, error);
         }
+        mark_user_session_log_pending(&state, &auth, session.id);
 
         let top_k = value_as_i32(ai_config.parameters.get("top_k"), 4);
         let (stream_tx, mut stream_rx) = mpsc::unbounded_channel();
@@ -4569,13 +4579,7 @@ async fn chat_stream(
             }
         }
 
-        persist_user_session_log(
-            &state.internal,
-            &auth,
-            session.id,
-            chat_request_session_log_turns(&request, &answer),
-        )
-        .await;
+        record_user_session_log(&state, &auth, &session).await;
 
         for emission in chat_stream_terminal_emissions(
             &message_id,
@@ -4609,6 +4613,7 @@ async fn query(
 
     let session = get_or_create_web_session(&state, request.session_id.as_deref(), &auth)?;
     update_session_last_question(&state, session.id, &request.question)?;
+    mark_user_session_log_pending(&state, &auth, session.id);
 
     let mut profile = HashMap::new();
     if auth.kind != "admin" && auth.id != -1 {
@@ -4660,6 +4665,7 @@ async fn query(
     memory
         .store_message_deferred(&memory_user_id, "user", &request.question)
         .map_err(internal_error)?;
+    mark_user_session_log_pending(&state, &auth, session.id);
 
     let enabled_tools = query_enabled_tool_sets(&request);
     let chat_request = ChatRequest {
@@ -4667,7 +4673,6 @@ async fn query(
         session_id: request.session_id.clone(),
         conversation_surface: None,
         tools: enabled_tools,
-        conversation_history: Vec::new(),
         job_ids: request.job_ids.clone(),
         conversation_channel: None,
         client_decrypted_context: None,
@@ -4746,13 +4751,7 @@ async fn query(
             );
         }
     }
-    persist_user_session_log(
-        &state.internal,
-        &auth,
-        session.id,
-        query_request_session_log_turns(&request, &answer),
-    )
-    .await;
+    record_user_session_log(&state, &auth, &session).await;
 
     Ok(Json(QueryResponse {
         answer: answer.clone(),
@@ -5260,81 +5259,303 @@ fn session_log_title(auth: &InternalAuthContext) -> String {
         .unwrap_or_else(|| "User Conversation".to_string())
 }
 
-fn chat_request_session_log_turns(
-    request: &ChatRequest,
-    assistant_answer: &str,
-) -> Vec<InternalSessionLogTurn> {
-    let mut turns = request
-        .conversation_history
-        .iter()
-        .filter(|turn| matches!(turn.role.as_str(), "user" | "assistant" | "system"))
-        .map(|turn| InternalSessionLogTurn {
-            role: turn.role.clone(),
-            content: turn.content.clone(),
-            ts: None,
+/// How Sage keeps a User Conversation's Admin review record in step.
+///
+/// Each Conversation carries `session_log_retry_at`: NULL when its record is up
+/// to date, otherwise when Sage should next resend it. Every write sets it five
+/// minutes ahead, so a Conversation in use is not retried mid-turn, and a failed
+/// retry moves to the back of the queue. The retry loop checks every minute.
+const SESSION_LOG_RETRY_DELAY: Duration = Duration::from_secs(5 * 60);
+const SESSION_LOG_RETRY_INTERVAL: Duration = Duration::from_secs(60);
+const SESSION_LOG_RETRY_BATCH: i64 = 50;
+const SESSION_LOG_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Message roles that make up a User Conversation record; tool context and
+/// other internal messages stay out of it.
+const RECORDED_MESSAGE_ROLES: [&str; 2] = ["user", "assistant"];
+
+/// Whether this actor's Conversations are recorded for Admin review.
+fn has_recorded_conversations(auth: &InternalAuthContext) -> bool {
+    auth.kind == "user" && auth.id != -1
+}
+
+/// A User Conversation's review record, built from Sage's retained messages.
+#[derive(Debug, PartialEq)]
+struct SessionLogRecord {
+    messages: Vec<InternalSessionLogMessage>,
+    /// Sequence ID of the newest message the record covers. Sage assigns
+    /// sequence IDs in storage order, so later reads have higher ones.
+    through_sequence_id: i64,
+}
+
+/// Every retained user and assistant message, oldest first, with Sage's
+/// message IDs. Tool context and other internal messages stay out of the
+/// record. None when nothing is retained.
+fn session_log_record(messages: Vec<StoredMessageRow>) -> Option<SessionLogRecord> {
+    let mut through_sequence_id = None;
+    let messages = messages
+        .into_iter()
+        .filter(|message| RECORDED_MESSAGE_ROLES.contains(&message.role.as_str()))
+        .map(|message| {
+            through_sequence_id = through_sequence_id.max(Some(message.sequence_id));
+            InternalSessionLogMessage {
+                message_id: message.id.to_string(),
+                role: message.role,
+                content: message.content,
+                ts: Some(message.created_at.to_rfc3339()),
+            }
         })
-        .collect::<Vec<_>>();
-    turns.push(InternalSessionLogTurn {
-        role: "user".to_string(),
-        content: request.message.clone(),
-        ts: None,
-    });
-    turns.push(InternalSessionLogTurn {
-        role: "assistant".to_string(),
-        content: assistant_answer.to_string(),
-        ts: None,
-    });
-    turns
+        .collect();
+    Some(SessionLogRecord {
+        messages,
+        through_sequence_id: through_sequence_id?,
+    })
 }
 
-fn query_request_session_log_turns(
-    request: &QueryRequest,
-    assistant_answer: &str,
-) -> Vec<InternalSessionLogTurn> {
-    vec![
-        InternalSessionLogTurn {
-            role: "user".to_string(),
-            content: request.question.clone(),
-            ts: None,
-        },
-        InternalSessionLogTurn {
-            role: "assistant".to_string(),
-            content: assistant_answer.to_string(),
-            ts: None,
-        },
-    ]
-}
-
-async fn persist_user_session_log(
-    internal: &InternalAgentClient,
+/// Marks a User Conversation's review record as owed. Turns call this when they
+/// start, once the user's message is stored, and before updating the record, so
+/// an exchange interrupted at any point (a failed update, a dropped connection,
+/// a restart) is still recorded by `retry_pending_session_logs`. Returns the
+/// mark, which only the matching update may clear.
+fn mark_user_session_log_pending(
+    state: &WebAppState,
     auth: &InternalAuthContext,
     session_id: Uuid,
-    turns: Vec<InternalSessionLogTurn>,
-) {
-    if auth.kind != "user" || auth.id == -1 || turns.is_empty() {
-        return;
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    if !has_recorded_conversations(auth) {
+        return None;
     }
-    let payload = InternalSessionLogRequest {
-        actor: auth.clone(),
-        turns,
-        sage_session_id: Some(session_id.to_string()),
-        user_type_id: auth.user_type_id,
-        title: Some(session_log_title(auth)),
-    };
-    match internal.log_user_session(&payload).await {
-        Ok(response) => {
-            debug!(
-                "persisted encrypted beta user session log {} for session {} (status={}, turns={})",
-                response.log_id, session_id, response.status, response.turn_count
-            );
-        }
+    match set_session_log_retry_at(state, session_id) {
+        Ok(mark) => Some(mark),
         Err(error) => {
             warn!(
-                "failed to persist encrypted beta user session log for session {}: {}",
-                session_id, error
+                "failed to mark the session log pending for session {}: {}",
+                session_id, error.message
             );
+            None
         }
     }
+}
+
+/// Brings the Admin review record of a User Conversation up to date after an
+/// exchange.
+async fn record_user_session_log(
+    state: &WebAppState,
+    auth: &InternalAuthContext,
+    session: &WebSessionRow,
+) {
+    let Some(mark) = mark_user_session_log_pending(state, auth, session.id) else {
+        return;
+    };
+    if let Err(error) = send_session_log(state, auth, session, mark).await {
+        warn!(
+            "failed to record the user session log for session {}; will retry: {}",
+            session.id, error
+        );
+    }
+}
+
+/// Sends the Conversation's current record, then clears `mark` if nothing has
+/// changed since: no later mark and no newer messages.
+async fn send_session_log(
+    state: &WebAppState,
+    actor: &InternalAuthContext,
+    session: &WebSessionRow,
+    mark: chrono::DateTime<chrono::Utc>,
+) -> Result<()> {
+    let messages =
+        load_session_messages(state, session.agent_id).map_err(|error| anyhow!(error.message))?;
+    let Some(record) = session_log_record(messages) else {
+        // Nothing is retained, for example after Session Memory deletion.
+        clear_session_log_retry(state, session, mark, i64::MIN)
+            .map_err(|error| anyhow!(error.message))?;
+        return Ok(());
+    };
+    let payload = InternalSessionLogRequest {
+        actor: actor.clone(),
+        messages: record.messages,
+        through_sequence_id: record.through_sequence_id,
+        sage_session_id: session.id.to_string(),
+        title: Some(session_log_title(actor)),
+    };
+    let response = state.internal.log_user_session(&payload).await?;
+    debug!(
+        "recorded encrypted user session log {} for session {} (status={}, messages={})",
+        response.log_id, session.id, response.status, response.turn_count
+    );
+    clear_session_log_retry(state, session, mark, record.through_sequence_id)
+        .map_err(|error| anyhow!(error.message))?;
+    Ok(())
+}
+
+fn set_session_log_retry_at(
+    state: &WebAppState,
+    session_id: Uuid,
+) -> AppResult<chrono::DateTime<chrono::Utc>> {
+    // Postgres keeps microseconds; store exactly what the clear compares.
+    let retry_at = (chrono::Utc::now() + SESSION_LOG_RETRY_DELAY).trunc_subsecs(6);
+    let mut conn = state
+        .db
+        .lock()
+        .map_err(|_| AppError::internal("failed to acquire database lock"))?;
+    diesel::update(web_sessions::table.filter(web_sessions::id.eq(session_id)))
+        .set(web_sessions::session_log_retry_at.eq(Some(retry_at)))
+        .execute(&mut *conn)
+        .map_err(internal_error)?;
+    Ok(retry_at)
+}
+
+/// Clears `mark` unless a later turn re-marked the Conversation or stored
+/// messages newer than the recorded ones; their own update, or a retry, records
+/// those.
+fn clear_session_log_retry(
+    state: &WebAppState,
+    session: &WebSessionRow,
+    mark: chrono::DateTime<chrono::Utc>,
+    recorded_through_sequence_id: i64,
+) -> AppResult<()> {
+    let newer_messages = messages::table
+        .filter(messages::agent_id.eq(session.agent_id))
+        .filter(messages::role.eq_any(RECORDED_MESSAGE_ROLES))
+        .filter(messages::sequence_id.gt(recorded_through_sequence_id));
+    let mut conn = state
+        .db
+        .lock()
+        .map_err(|_| AppError::internal("failed to acquire database lock"))?;
+    diesel::update(
+        web_sessions::table
+            .filter(web_sessions::id.eq(session.id))
+            .filter(web_sessions::session_log_retry_at.eq(mark))
+            .filter(diesel::dsl::not(diesel::dsl::exists(newer_messages))),
+    )
+    .set(web_sessions::session_log_retry_at.eq(None::<chrono::DateTime<chrono::Utc>>))
+    .execute(&mut *conn)
+    .map_err(internal_error)?;
+    Ok(())
+}
+
+/// Resends unconfirmed User Conversation records once they are due, starting
+/// at boot.
+async fn retry_pending_session_logs(state: WebAppState) {
+    let mut interval = tokio::time::interval(SESSION_LOG_RETRY_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        interval.tick().await;
+        let due = match load_due_session_logs(&state) {
+            Ok(due) => due,
+            Err(error) => {
+                warn!("failed to load pending session logs: {}", error.message);
+                continue;
+            }
+        };
+        for (session, display_name) in due {
+            retry_session_log(&state, &session, display_name).await;
+        }
+    }
+}
+
+async fn retry_session_log(
+    state: &WebAppState,
+    session: &WebSessionRow,
+    display_name: Option<String>,
+) {
+    let Some(actor) = session_log_retry_actor(session, display_name) else {
+        warn!(
+            "session {} has no User owner to record; dropping its pending session log",
+            session.id
+        );
+        if let Err(error) = drop_session_log_retry(state, session.id) {
+            warn!(
+                "failed to drop the session log retry for {}: {}",
+                session.id, error.message
+            );
+        }
+        return;
+    };
+    // Re-marking first moves this Conversation to the back of the queue if the
+    // retry fails again.
+    let mark = match set_session_log_retry_at(state, session.id) {
+        Ok(mark) => mark,
+        Err(error) => {
+            warn!(
+                "failed to reschedule the session log for {}: {}",
+                session.id, error.message
+            );
+            return;
+        }
+    };
+    if let Err(error) = send_session_log(state, &actor, session, mark).await {
+        warn!(
+            "retrying the user session log for session {} failed: {}",
+            session.id, error
+        );
+    }
+}
+
+fn drop_session_log_retry(state: &WebAppState, session_id: Uuid) -> AppResult<()> {
+    let mut conn = state
+        .db
+        .lock()
+        .map_err(|_| AppError::internal("failed to acquire database lock"))?;
+    diesel::update(web_sessions::table.filter(web_sessions::id.eq(session_id)))
+        .set(web_sessions::session_log_retry_at.eq(None::<chrono::DateTime<chrono::Utc>>))
+        .execute(&mut *conn)
+        .map_err(internal_error)?;
+    Ok(())
+}
+
+fn load_due_session_logs(state: &WebAppState) -> AppResult<Vec<(WebSessionRow, Option<String>)>> {
+    let mut conn = state
+        .db
+        .lock()
+        .map_err(|_| AppError::internal("failed to acquire database lock"))?;
+    let sessions: Vec<WebSessionRow> = web_sessions::table
+        .filter(web_sessions::session_log_retry_at.le(chrono::Utc::now()))
+        .order(web_sessions::session_log_retry_at.asc())
+        .limit(SESSION_LOG_RETRY_BATCH)
+        .select(WebSessionRow::as_select())
+        .load(&mut *conn)
+        .map_err(internal_error)?;
+    sessions
+        .into_iter()
+        .map(|session| {
+            let display_name = external_identities::table
+                .filter(external_identities::identity_type.eq(&session.owner_type))
+                .filter(external_identities::external_id.eq(&session.owner_id))
+                .select(external_identities::display_name)
+                .first::<Option<String>>(&mut *conn)
+                .optional()
+                .map_err(internal_error)?
+                .flatten();
+            Ok((session, display_name))
+        })
+        .collect()
+}
+
+/// The User a pending record belongs to. Only the ID identifies the subject to
+/// the backend; the display name restores the record's usual title.
+fn session_log_retry_actor(
+    session: &WebSessionRow,
+    display_name: Option<String>,
+) -> Option<InternalAuthContext> {
+    if session.owner_type != "user" {
+        return None;
+    }
+    let id = session
+        .owner_id
+        .parse::<i32>()
+        .ok()
+        .filter(|id| *id != -1)?;
+    Some(InternalAuthContext {
+        id,
+        kind: "user".to_string(),
+        approved: true,
+        pubkey: None,
+        email: None,
+        name: display_name,
+        user_type_id: session.user_type_id,
+        dev_mode: false,
+    })
 }
 
 fn maybe_load_web_session(
@@ -12002,6 +12223,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn backend_client_does_not_reuse_connections_past_the_idle_limit() {
+        use axum::serve::ListenerExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // A keep-alive server that counts the TCP connections it accepts.
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = accepted.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test backend should bind");
+        let addr = listener
+            .local_addr()
+            .expect("test backend should expose local addr");
+        let listener = listener.tap_io(move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+        let app = Router::new().route("/health", get(|| async { "ok" }));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test backend should serve");
+        });
+        let url = format!("http://{}/health", addr);
+
+        let client =
+            backend_http_client(Duration::from_millis(100)).expect("backend client should build");
+        client.get(&url).send().await.expect("first request");
+        client.get(&url).send().await.expect("immediate request");
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "a busy connection is reused"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        client.get(&url).send().await.expect("request after idling");
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            2,
+            "an idle connection is not reused past the limit"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn internal_client_posts_user_session_logs_with_token() {
         let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<(Option<String>, Value)>();
         let seen_tx = Arc::new(Mutex::new(Some(seen_tx)));
@@ -12058,20 +12323,22 @@ mod tests {
         };
         let payload = InternalSessionLogRequest {
             actor,
-            turns: vec![
-                InternalSessionLogTurn {
+            messages: vec![
+                InternalSessionLogMessage {
+                    message_id: "22222222-2222-2222-2222-222222222222".to_string(),
                     role: "user".to_string(),
                     content: "Hello".to_string(),
-                    ts: None,
+                    ts: Some("2026-10-23T12:00:00+00:00".to_string()),
                 },
-                InternalSessionLogTurn {
+                InternalSessionLogMessage {
+                    message_id: "33333333-3333-3333-3333-333333333333".to_string(),
                     role: "assistant".to_string(),
                     content: "Hi".to_string(),
-                    ts: None,
+                    ts: Some("2026-10-23T12:00:01+00:00".to_string()),
                 },
             ],
-            sage_session_id: Some("11111111-1111-1111-1111-111111111111".to_string()),
-            user_type_id: Some(7),
+            through_sequence_id: 42,
+            sage_session_id: "11111111-1111-1111-1111-111111111111".to_string(),
             title: Some("User Conversation - Test Person".to_string()),
         };
 
@@ -12095,8 +12362,147 @@ mod tests {
             "11111111-1111-1111-1111-111111111111"
         );
         assert_eq!(payload["title"], "User Conversation - Test Person");
-        assert_eq!(payload["turns"][0]["role"], "user");
-        assert_eq!(payload["turns"][1]["content"], "Hi");
+        assert_eq!(payload["messages"][0]["role"], "user");
+        assert_eq!(
+            payload["messages"][0]["message_id"],
+            "22222222-2222-2222-2222-222222222222"
+        );
+        assert_eq!(payload["messages"][1]["content"], "Hi");
+        assert_eq!(payload["through_sequence_id"], 42);
+        assert!(payload.get("turns").is_none());
+        assert!(payload.get("user_type_id").is_none());
+    }
+
+    fn stored_message(role: &str, content: &str, sequence_id: i64) -> StoredMessageRow {
+        StoredMessageRow {
+            id: Uuid::new_v4(),
+            agent_id: Uuid::nil(),
+            user_id: "user:42".to_string(),
+            role: role.to_string(),
+            content: content.to_string(),
+            sequence_id,
+            tool_calls: None,
+            tool_results: None,
+            created_at: chrono::Utc::now(),
+            attachment_text: None,
+        }
+    }
+
+    fn user_web_session(owner_id: &str) -> WebSessionRow {
+        WebSessionRow {
+            id: Uuid::new_v4(),
+            agent_id: Uuid::new_v4(),
+            owner_type: "user".to_string(),
+            owner_id: owner_id.to_string(),
+            user_type_id: Some(3),
+            last_question: None,
+            title: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn session_log_record_is_the_complete_user_and_assistant_history() {
+        let messages: Vec<StoredMessageRow> = (1..=50)
+            .flat_map(|exchange| {
+                [
+                    stored_message("user", &format!("Question {exchange}"), exchange * 10),
+                    stored_message(
+                        "tool",
+                        "Admin Config tool completed: read_agent_settings.",
+                        exchange * 10 + 1,
+                    ),
+                    stored_message(
+                        "assistant",
+                        &format!("Answer {exchange}"),
+                        exchange * 10 + 2,
+                    ),
+                ]
+            })
+            .collect();
+        let first_answer_id = messages[2].id.to_string();
+        let first_answer_created_at = messages[2].created_at.to_rfc3339();
+
+        let record = session_log_record(messages).expect("history should produce a record");
+
+        assert_eq!(record.messages.len(), 100);
+        assert_eq!(record.through_sequence_id, 502);
+        assert_eq!(record.messages[0].content, "Question 1");
+        assert_eq!(record.messages[1].message_id, first_answer_id);
+        assert_eq!(
+            record.messages[1].ts.as_deref(),
+            Some(first_answer_created_at.as_str())
+        );
+        assert_eq!(record.messages[99].content, "Answer 50");
+        assert!(record
+            .messages
+            .iter()
+            .all(|message| message.role == "user" || message.role == "assistant"));
+    }
+
+    #[test]
+    fn session_log_record_is_absent_without_retained_conversation_messages() {
+        assert_eq!(session_log_record(Vec::new()), None);
+        assert_eq!(
+            session_log_record(vec![stored_message("tool", "internal context", 7)]),
+            None
+        );
+    }
+
+    #[test]
+    fn only_signed_in_users_have_recorded_conversations() {
+        let mut actor = InternalAuthContext {
+            id: 42,
+            kind: "user".to_string(),
+            approved: true,
+            pubkey: None,
+            email: None,
+            name: None,
+            user_type_id: None,
+            dev_mode: false,
+        };
+        assert!(has_recorded_conversations(&actor));
+        actor.id = -1;
+        assert!(!has_recorded_conversations(&actor));
+        actor.id = 1;
+        actor.kind = "admin".to_string();
+        assert!(!has_recorded_conversations(&actor));
+    }
+
+    #[test]
+    fn retried_session_logs_belong_to_the_session_owner() {
+        let session = user_web_session("42");
+        let actor = session_log_retry_actor(&session, Some("Avery".to_string()))
+            .expect("a User session should have a retry actor");
+
+        assert_eq!(actor.id, 42);
+        assert_eq!(actor.kind, "user");
+        assert_eq!(actor.user_type_id, Some(3));
+        assert_eq!(session_log_title(&actor), "User Conversation - Avery");
+
+        assert!(session_log_retry_actor(&user_web_session("-1"), None).is_none());
+        assert!(session_log_retry_actor(&user_web_session("not-a-user-id"), None).is_none());
+        let mut admin_session = user_web_session("1");
+        admin_session.owner_type = "admin".to_string();
+        assert!(session_log_retry_actor(&admin_session, None).is_none());
+    }
+
+    #[test]
+    fn chat_requests_ignore_client_supplied_conversation_history() {
+        let request: ChatRequest = serde_json::from_value(json!({
+            "message": "hello",
+            "session_id": "session-123",
+            "conversation_history": [
+                { "role": "user", "content": "client-side copy of an earlier turn" }
+            ]
+        }))
+        .expect("requests from older browsers should still deserialize");
+
+        assert_eq!(request.message, "hello");
+        assert!(!serde_json::to_string(&request)
+            .expect("request should serialize")
+            .contains("client-side copy"));
     }
 
     #[tokio::test]
@@ -12706,7 +13112,6 @@ mod tests {
             session_id: Some("session-123".to_string()),
             conversation_surface: None,
             tools: vec![CURATED_RESOURCES_TOOL_SET_ID.to_string()],
-            conversation_history: Vec::new(),
             job_ids: None,
             conversation_channel: None,
             client_decrypted_context: None,
@@ -12786,7 +13191,6 @@ mod tests {
             session_id: None,
             conversation_surface: Some(ADMIN_ONBOARDING_SURFACE.to_string()),
             tools: vec![ADMIN_CONFIG_TOOL_SET_ID.to_string()],
-            conversation_history: Vec::new(),
             job_ids: None,
             conversation_channel: None,
             client_decrypted_context: None,
@@ -14362,10 +14766,6 @@ mod tests {
             session_id: Some("session-123".to_string()),
             conversation_surface: None,
             tools: vec!["admin-config".to_string()],
-            conversation_history: vec![ChatHistoryMessage {
-                role: "user".to_string(),
-                content: "stale client-only turn".to_string(),
-            }],
             job_ids: None,
             conversation_channel: Some(ConversationChannelRequest {
                 kind: "signal".to_string(),
@@ -14384,7 +14784,6 @@ mod tests {
         assert!(input.contains("channel_delivery: short_messages"));
         assert!(input.contains("=== SESSION MEMORY SUMMARY ==="));
         assert!(input.contains("Persisted summary from Sage Session Memory."));
-        assert!(!input.contains("stale client-only turn"));
         assert!(!input.contains("=== PREPARED CONTEXT ==="));
         assert_eq!(memory_user_id(&auth), "admin:1");
     }
@@ -15950,7 +16349,6 @@ mod tests {
                 "db-query".to_string(),
                 "admin-config".to_string(),
             ],
-            conversation_history: Vec::new(),
             job_ids: Some(vec!["doc-handbook".to_string()]),
             conversation_channel: None,
             client_decrypted_context: None,
@@ -16109,7 +16507,6 @@ mod tests {
             session_id: None,
             conversation_surface: None,
             tools: vec!["db-query".to_string()],
-            conversation_history: Vec::new(),
             job_ids: None,
             conversation_channel: None,
             client_decrypted_context: Some(json!({
@@ -16160,7 +16557,6 @@ mod tests {
             session_id: None,
             conversation_surface: None,
             tools: vec!["db-query".to_string()],
-            conversation_history: Vec::new(),
             job_ids: None,
             conversation_channel: None,
             client_decrypted_context: Some(json!({
@@ -16198,7 +16594,6 @@ mod tests {
             session_id: None,
             conversation_surface: None,
             tools: Vec::new(),
-            conversation_history: Vec::new(),
             job_ids: None,
             conversation_channel: None,
             client_decrypted_context: Some(json!({
@@ -16230,7 +16625,6 @@ mod tests {
             session_id: None,
             conversation_surface: None,
             tools: vec!["db-query".to_string()],
-            conversation_history: Vec::new(),
             job_ids: None,
             conversation_channel: None,
             client_decrypted_context: Some(json!({
@@ -16263,7 +16657,6 @@ mod tests {
             session_id: None,
             conversation_surface: None,
             tools: vec!["db-query".to_string()],
-            conversation_history: Vec::new(),
             job_ids: None,
             conversation_channel: None,
             client_decrypted_context: None,
@@ -16304,7 +16697,6 @@ mod tests {
             session_id: None,
             conversation_surface: None,
             tools: vec!["db-query".to_string()],
-            conversation_history: Vec::new(),
             job_ids: None,
             conversation_channel: None,
             client_decrypted_context: None,
@@ -16348,7 +16740,6 @@ mod tests {
             session_id: None,
             conversation_surface: None,
             tools: vec!["admin-config".to_string(), "knowledge-search".to_string()],
-            conversation_history: Vec::new(),
             job_ids: Some(vec!["doc-handbook".to_string()]),
             conversation_channel: None,
             client_decrypted_context: None,
@@ -16807,7 +17198,6 @@ mod tests {
                 CURATED_RESOURCES_TOOL_SET_ID.to_string(),
                 KNOWLEDGE_SEARCH_TOOL_SET_ID.to_string(),
             ],
-            conversation_history: Vec::new(),
             job_ids: request.job_ids.clone(),
             conversation_channel: None,
             client_decrypted_context: None,

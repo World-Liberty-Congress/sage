@@ -127,6 +127,7 @@ Active calls:
 - `find_resources` exposes a smaller model-facing contract: optional `exact_resource`, `region`, `language`, and continuation `offset`. Sage maps `exact_resource` to the private endpoint's `query` field and leaves private `kind` and `tags` unset, removing guess-prone facets from the model without adding a classifier or forced lookup. The Conversation model decides whether to call the Tool and may use returned pagination metadata on a later turn. Sage validates arguments and backend page consistency, but does not force a lookup, rewrite the selected batch, or quarantine final prose for completeness claims.
 - `GET /internal/agent/admin-db-schema` — allowlisted live table/column/relationship metadata, SQL restrictions, encrypted-identity guidance, and recorded-usage semantics; no row values.
 - `POST /internal/agent/admin-db-query`
+- `POST /internal/agent/session-logs` — the Admin review record of a User Conversation: every retained user and assistant message with its Sage message ID, oldest first, plus `through_sequence_id` (the newest message's sequence number). The backend ignores updates that are not newer, so retries are safe. See Enclave ADR-0035.
 
 ADR-0023 target calls:
 
@@ -217,6 +218,8 @@ Important tables in `schema.rs` on this branch:
 Current reality:
 
 - `web_sessions` and `external_identities` are actively used
+- `web_sessions.session_log_retry_at` marks a User Conversation whose review record the backend has not confirmed. Turns set it five minutes ahead when they start, once the user message is stored, and before each update; an update clears only its own mark, and only if no newer messages exist. A background loop started with the router resends due records every minute from boot and reschedules failures five minutes out.
+- The shared HTTP client drops idle pooled connections after four seconds, below the backend's five-second keep-alive, so requests are never sent on a connection the backend is closing.
 - AI config CRUD is now Sage-backed
 - query-session deletion still deletes the session record only, not the full memory graph
 
