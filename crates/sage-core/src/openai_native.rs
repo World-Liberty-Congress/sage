@@ -500,8 +500,17 @@ fn consume_sse_line(
     }
     let usage_value = value.get("usage").filter(|usage| !usage.is_null());
     let mut emitted_usage = false;
-    if state.usage.is_none() {
-        if let Some(usage) = usage_value.and_then(parse_usage) {
+    if let Some(mut usage) = usage_value.and_then(parse_usage) {
+        if let Some(previous) = &state.usage {
+            // Providers may send provisional counts before the final usage frame.
+            // A missing field is unknown, not a replacement for a reported count.
+            usage.prompt_tokens = usage.prompt_tokens.or(previous.prompt_tokens);
+            usage.completion_tokens = usage.completion_tokens.or(previous.completion_tokens);
+            usage.total_tokens = usage.total_tokens.or(previous.total_tokens);
+            usage.cached_tokens = usage.cached_tokens.or(previous.cached_tokens);
+            usage.reasoning_tokens = usage.reasoning_tokens.or(previous.reasoning_tokens);
+        }
+        if state.usage.as_ref() != Some(&usage) {
             if let Some(sender) = signal_sender {
                 let _ = sender.send(NativeProviderSignal::Usage(usage.clone()));
             }
@@ -1408,7 +1417,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_usage_observations_keep_the_first_valid_observation() {
+    fn streamed_usage_keeps_the_latest_reported_counts() {
         let mut state = NativeStreamState::default();
         consume_sse_line(
             r#"data: {"choices":[],"usage":{"prompt_tokens":11}}"#,
@@ -1432,8 +1441,50 @@ mod tests {
 
         assert_eq!(
             finish_stream(state).unwrap().usage.unwrap().prompt_tokens,
-            Some(11)
+            Some(99)
         );
+    }
+
+    #[test]
+    fn final_streamed_usage_replaces_initial_zero_counts() {
+        let mut state = NativeStreamState::default();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        for line in [
+            r#"data: {"choices":[{"delta":{"role":"assistant"},"finish_reason":null}],"usage":{"prompt_tokens":41,"completion_tokens":0,"total_tokens":41}}"#,
+            r#"data: {"choices":[{"delta":{"content":"Complete."},"finish_reason":"stop"}]}"#,
+            r#"data: {"choices":[],"usage":{"prompt_tokens":41,"completion_tokens":17,"total_tokens":58}}"#,
+            "data: [DONE]",
+        ] {
+            consume_sse_line(line, &mut state, &Some(sender.clone())).unwrap();
+        }
+        let turn = finish_stream(state).unwrap();
+        assert_eq!(turn.content, "Complete.");
+        assert_eq!(turn.usage.as_ref().unwrap().completion_tokens, Some(17));
+        let mut observed = None;
+        while let Ok(signal) = receiver.try_recv() {
+            if let NativeProviderSignal::Usage(usage) = signal {
+                observed = Some(usage);
+            }
+        }
+        assert_eq!(observed.unwrap(), turn.usage.unwrap());
+    }
+
+    #[test]
+    fn partial_usage_preserves_reported_fields_and_unknowns() {
+        let mut state = NativeStreamState::default();
+        for line in [
+            r#"data: {"choices":[],"usage":{"prompt_tokens":41,"prompt_tokens_details":{"cached_tokens":11}}}"#,
+            r#"data: {"choices":[],"usage":{"completion_tokens":17,"total_tokens":58}}"#,
+            r#"data: {"choices":[],"usage":{"prompt_tokens":"invalid","completion_tokens":null}}"#,
+        ] {
+            consume_sse_line(line, &mut state, &None).unwrap();
+        }
+        let usage = state.usage.unwrap();
+        assert_eq!(usage.prompt_tokens, Some(41));
+        assert_eq!(usage.completion_tokens, Some(17));
+        assert_eq!(usage.total_tokens, Some(58));
+        assert_eq!(usage.cached_tokens, Some(11));
+        assert_eq!(usage.reasoning_tokens, None);
     }
 
     #[test]
