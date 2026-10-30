@@ -219,10 +219,59 @@ async fn postgres_purge_is_atomic_scoped_idempotent_and_covers_identity_only() {
     assert_eq!(result["deletion"]["status"], "succeeded");
     assert!(get_or_create_web_session(&state, None, &stale_auth).is_err());
     assert_eq!(
-        delete_user_runtime(State(state), headers, Path(701))
+        delete_user_runtime(State(state.clone()), headers, Path(701))
             .await
             .unwrap()
             .0["conversations_deleted"],
         0
     );
+    // Deterministically pause a Conversation DELETE at its authorized snapshot,
+    // purge the User, then recreate that UUID under Admin ownership.
+    let (replacement, admin_turn) =
+        get_or_create_web_session(&state, Some(&session.id.to_string()), &admin_auth).unwrap();
+    let _stale_delete = state
+        .owner_activity
+        .exclusive("user", "701", false)
+        .unwrap();
+    let mut conn = state.db.lock().unwrap();
+    conn.batch_execute(&format!(
+        "INSERT INTO agents(id,name,system_prompt) VALUES ('{}','fixture','fixture');
+         INSERT INTO messages(agent_id,user_id,role,content) VALUES ('{}','admin:99','assistant','synthetic');",
+        replacement.agent_id, replacement.agent_id,
+    )).unwrap();
+    for remove_session in [true, false] {
+        assert_eq!(
+            delete_session_state(&mut conn, &session, remove_session)
+                .unwrap_err()
+                .status,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            web_sessions::table
+                .find(replacement.id)
+                .count()
+                .get_result::<i64>(&mut *conn)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            messages::table
+                .filter(messages::agent_id.eq(replacement.agent_id))
+                .count()
+                .get_result::<i64>(&mut *conn)
+                .unwrap(),
+            1
+        );
+    }
+    drop(admin_turn);
+    let _admin_delete = state
+        .owner_activity
+        .exclusive("admin", "99", false)
+        .unwrap();
+    assert!(delete_session_state(&mut conn, &replacement, true)
+        .unwrap()
+        .is_some());
+    assert!(delete_session_state(&mut conn, &replacement, true)
+        .unwrap()
+        .is_none());
 }

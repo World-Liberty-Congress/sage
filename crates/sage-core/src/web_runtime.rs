@@ -1154,7 +1154,7 @@ struct StoredMessageRow {
     attachment_text: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 struct SessionMemoryDeletionCounts {
     messages: usize,
     summaries: usize,
@@ -5077,13 +5077,9 @@ async fn delete_query_session(
         .db
         .lock()
         .map_err(|_| AppError::internal("failed to acquire database lock"))?;
-    let memory_deletion = conn.transaction::<_, AppError, _>(|conn| {
-        let counts = delete_session_memory_for_agent(conn, session.agent_id)?;
-        diesel::delete(web_sessions::table.filter(web_sessions::id.eq(session.id)))
-            .execute(conn)
-            .map_err(internal_error)?;
-        Ok(counts)
-    })?;
+    let Some(memory_deletion) = delete_session_state(&mut conn, &session, true)? else {
+        return Ok(Json(summarize_missing_query_session_deletion()));
+    };
 
     Ok(Json(json!({
         "status": "deleted",
@@ -5133,9 +5129,7 @@ async fn delete_session_memory_internal(
         .db
         .lock()
         .map_err(|_| AppError::internal("failed to acquire database lock"))?;
-    let memory_deletion = conn.transaction::<_, AppError, _>(|conn| {
-        delete_session_memory_for_agent(conn, session.agent_id)
-    })?;
+    let memory_deletion = delete_session_state(&mut conn, &session, false)?.unwrap_or_default();
 
     Ok(Json(json!({
         "status": "deleted",
@@ -5981,6 +5975,40 @@ fn truncate_conversation_history_title(value: &str) -> String {
         title.push_str("...");
     }
     title
+}
+
+/// Caller holds the authorized owner's exclusive admission. A UUID may have
+/// been recreated under another owner before that admission was acquired.
+fn delete_session_state(
+    conn: &mut PgConnection,
+    expected: &WebSessionRow,
+    remove_session: bool,
+) -> AppResult<Option<SessionMemoryDeletionCounts>> {
+    conn.transaction::<_, AppError, _>(|conn| {
+        let Some(current) = web_sessions::table
+            .find(expected.id)
+            .select(WebSessionRow::as_select())
+            .first(conn)
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        if current.owner_type != expected.owner_type
+            || current.owner_id != expected.owner_id
+            || current.agent_id != expected.agent_id
+        {
+            return Err(AppError::new(
+                StatusCode::CONFLICT,
+                "Conversation changed; retry",
+            ));
+        }
+        let counts = delete_session_memory_for_agent(conn, current.agent_id)?;
+        if remove_session {
+            diesel::delete(web_sessions::table.filter(web_sessions::id.eq(current.id)))
+                .execute(conn)?;
+        }
+        Ok(Some(counts))
+    })
 }
 
 fn delete_session_memory_for_agent(
