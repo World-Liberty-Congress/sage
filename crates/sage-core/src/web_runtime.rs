@@ -1590,8 +1590,8 @@ impl SearxWebSearchTool {
         let results = payload
             .get("results")
             .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
+            .ok_or_else(|| anyhow::Error::new(ToolExecutionError::MalformedContract))?
+            .iter()
             .take(count)
             .map(|result| {
                 json!({
@@ -1601,6 +1601,20 @@ impl SearxWebSearchTool {
                 })
             })
             .collect::<Vec<_>>();
+        let unavailable_providers = payload
+            .get("unresponsive_engines")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        if results.is_empty() && unavailable_providers > 0 {
+            return Err(anyhow::Error::new(ToolExecutionError::Other(
+                "Web Search providers were unavailable; no results were returned.".to_string(),
+            )));
+        }
+        let warnings = if unavailable_providers > 0 {
+            vec!["Some search providers were unavailable; results may be incomplete.".to_string()]
+        } else {
+            Vec::new()
+        };
 
         if let Ok(mut sink) = self.traces.lock() {
             sink.push(ToolCallInfoResponse {
@@ -1610,13 +1624,13 @@ impl SearxWebSearchTool {
                 output_summary: Some(
                     "Web search results were prepared for the answer.".to_string(),
                 ),
-                warnings: Vec::new(),
-                metadata: json!({}),
+                warnings: warnings.clone(),
+                metadata: json!({ "unavailable_provider_count": unavailable_providers }),
                 guarded: false,
             });
         }
 
-        Ok(json!({ "query": query, "results": results }))
+        Ok(json!({ "query": query, "results": results, "warnings": warnings }))
     }
 }
 
@@ -10702,6 +10716,7 @@ mod tests {
                 _ => (
                     [("content-type", "text/event-stream")],
                     concat!(
+                        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":89,\"completion_tokens\":0,\"total_tokens\":89}}\n\n",
                         "data: {\"choices\":[{\"delta\":{\"content\":\"Grounded answer.\"},\"finish_reason\":\"stop\"}]}\n\n",
                         "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":89,\"completion_tokens\":21,\"total_tokens\":110}}\n\n",
                         "data: [DONE]\n\n"
@@ -16667,6 +16682,51 @@ mod tests {
             traces[0].output_summary.as_deref(),
             Some("Web search results were prepared for the answer.")
         );
+    }
+
+    #[tokio::test]
+    async fn web_search_distinguishes_provider_failure_from_no_matches() {
+        for (payload, succeeds, warns) in [
+            (json!({"results": []}), true, false),
+            (
+                json!({"results": [], "unresponsive_engines": [["provider", "private-provider-error"]]}),
+                false,
+                false,
+            ),
+            (
+                json!({"results": [{"title": "Result", "url": "https://example.test"}], "unresponsive_engines": [["provider", "private-provider-error"]]}),
+                true,
+                true,
+            ),
+            (json!({"unexpected": []}), false, false),
+        ] {
+            let app = Router::new().route(
+                "/search",
+                get(move || {
+                    let payload = payload.clone();
+                    async move { Json(payload) }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let traces = Arc::new(Mutex::new(Vec::new()));
+            let tool = SearxWebSearchTool {
+                http: Client::new(),
+                searxng_url: format!("http://{address}"),
+                traces: traces.clone(),
+            };
+            let result = tool
+                .search_data(&ToolArgs::from([("query".into(), json!("fixture"))]))
+                .await;
+            server.abort();
+            assert_eq!(result.is_ok(), succeeds);
+            if let Ok(value) = result {
+                assert_eq!(!value["warnings"].as_array().unwrap().is_empty(), warns);
+                assert!(!value.to_string().contains("private-provider-error"));
+                assert_eq!(!traces.lock().unwrap()[0].warnings.is_empty(), warns);
+            }
+        }
     }
 
     #[test]
