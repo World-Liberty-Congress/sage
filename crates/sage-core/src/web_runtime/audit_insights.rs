@@ -299,6 +299,7 @@ mod tests {
                 http,
                 db,
                 user_lookups: Arc::new(user_lookup::PendingLookups::default()),
+                owner_activity: Arc::default(),
             };
             let app = Router::new()
                 .route(
