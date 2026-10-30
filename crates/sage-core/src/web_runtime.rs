@@ -42,6 +42,7 @@ mod agent_settings_writes;
 mod audit_insights;
 mod conversation_lookup;
 mod usage_insights;
+mod user_deletion;
 mod user_lookup;
 
 use crate::admin_config_views::{
@@ -186,6 +187,12 @@ impl AppError {
     }
 }
 
+impl From<diesel::result::Error> for AppError {
+    fn from(error: diesel::result::Error) -> Self {
+        internal_error(error)
+    }
+}
+
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         (self.status, Json(json!({ "detail": self.message }))).into_response()
@@ -259,6 +266,7 @@ pub struct WebAppState {
     pub db: Arc<Mutex<PgConnection>>,
     pub internal: InternalAgentClient,
     user_lookups: Arc<user_lookup::PendingLookups>,
+    owner_activity: Arc<user_deletion::OwnerActivity>,
 }
 
 /// The Python control plane (uvicorn) closes keep-alive connections that sit
@@ -289,6 +297,7 @@ pub fn build_router(config: Config, web_config: EnclaveWebConfig) -> Result<Rout
         db: Arc::new(Mutex::new(db_conn)),
         internal,
         user_lookups: Arc::default(),
+        owner_activity: Arc::default(),
     };
     seed_default_ai_config(&state).map_err(|error| anyhow!(error.message.clone()))?;
     if let Ok(runtime) = tokio::runtime::Handle::try_current() {
@@ -323,6 +332,10 @@ pub fn build_router(config: Config, web_config: EnclaveWebConfig) -> Result<Rout
         .route(
             "/internal/lifecycle/session-memory/delete",
             post(delete_session_memory_internal),
+        )
+        .route(
+            "/internal/lifecycle/users/{user_id}/delete",
+            post(user_deletion::delete_user_runtime),
         )
         .route("/session-defaults", get(session_defaults))
         .route("/admin/tools/execute", post(admin_tools_execute))
@@ -4271,7 +4284,8 @@ async fn chat(
     let lm_settings = RequestLmSettings::from_config(&state.config, temperature)?;
     lm_settings.configure_authoritative().await?;
 
-    let session = get_or_create_web_session(&state, request.session_id.as_deref(), &auth)?;
+    let (session, _activity) =
+        get_or_create_web_session(&state, request.session_id.as_deref(), &auth)?;
     update_session_last_question(&state, session.id, &request.message)?;
     mark_user_session_log_pending(&state, &auth, session.id);
 
@@ -4533,7 +4547,8 @@ async fn chat_stream(
     let temperature = value_as_f64(ai_config.parameters.get("temperature"), 0.1);
     let lm_settings = RequestLmSettings::from_config(&state.config, temperature)?;
     lm_settings.configure_authoritative().await?;
-    let session = get_or_create_web_session(&state, request.session_id.as_deref(), &auth)?;
+    let (session, _activity) =
+        get_or_create_web_session(&state, request.session_id.as_deref(), &auth)?;
     update_session_last_question(&state, session.id, &request.message)?;
     mark_user_session_log_pending(&state, &auth, session.id);
     let message_id = format!("msg_{}", Uuid::new_v4().simple());
@@ -4541,6 +4556,7 @@ async fn chat_stream(
 
     let lookup_fingerprint = user_lookup::fingerprint(&state.web_config, &headers);
     let stream = async_stream::stream! {
+        let _activity = _activity;
         let turn_started_at = Instant::now();
         let include_timing = auth.kind == "admin";
 
@@ -4778,7 +4794,8 @@ async fn query(
     let lm_settings = RequestLmSettings::from_config(&state.config, temperature)?;
     lm_settings.configure_authoritative().await?;
 
-    let session = get_or_create_web_session(&state, request.session_id.as_deref(), &auth)?;
+    let (session, _activity) =
+        get_or_create_web_session(&state, request.session_id.as_deref(), &auth)?;
     update_session_last_question(&state, session.id, &request.question)?;
     mark_user_session_log_pending(&state, &auth, session.id);
 
@@ -5052,14 +5069,21 @@ async fn delete_query_session(
     };
     ensure_session_access(&auth, &session)?;
 
+    let _exclusive =
+        state
+            .owner_activity
+            .exclusive(&session.owner_type, &session.owner_id, false)?;
     let mut conn = state
         .db
         .lock()
         .map_err(|_| AppError::internal("failed to acquire database lock"))?;
-    let memory_deletion = delete_session_memory_for_agent(&mut conn, session.agent_id)?;
-    diesel::delete(web_sessions::table.filter(web_sessions::id.eq(session.id)))
-        .execute(&mut *conn)
-        .map_err(internal_error)?;
+    let memory_deletion = conn.transaction::<_, AppError, _>(|conn| {
+        let counts = delete_session_memory_for_agent(conn, session.agent_id)?;
+        diesel::delete(web_sessions::table.filter(web_sessions::id.eq(session.id)))
+            .execute(conn)
+            .map_err(internal_error)?;
+        Ok(counts)
+    })?;
 
     Ok(Json(json!({
         "status": "deleted",
@@ -5101,11 +5125,17 @@ async fn delete_session_memory_internal(
         }
     };
 
+    let _exclusive =
+        state
+            .owner_activity
+            .exclusive(&session.owner_type, &session.owner_id, false)?;
     let mut conn = state
         .db
         .lock()
         .map_err(|_| AppError::internal("failed to acquire database lock"))?;
-    let memory_deletion = delete_session_memory_for_agent(&mut conn, session.agent_id)?;
+    let memory_deletion = conn.transaction::<_, AppError, _>(|conn| {
+        delete_session_memory_for_agent(conn, session.agent_id)
+    })?;
 
     Ok(Json(json!({
         "status": "deleted",
@@ -5342,12 +5372,33 @@ fn get_or_create_web_session(
     state: &WebAppState,
     requested_session_id: Option<&str>,
     auth: &InternalAuthContext,
-) -> AppResult<WebSessionRow> {
-    if let Some(session_id) = requested_session_id {
-        if let Some(existing) = maybe_load_web_session(state, session_id)? {
-            ensure_session_access(auth, &existing)?;
-            return Ok(existing);
+) -> AppResult<(WebSessionRow, tokio::sync::OwnedRwLockReadGuard<()>)> {
+    let existing = requested_session_id
+        .map(|id| maybe_load_web_session(state, id))
+        .transpose()?
+        .flatten();
+    let (owner_type, owner_id) = match &existing {
+        Some(session) => {
+            ensure_session_access(auth, session)?;
+            (session.owner_type.clone(), session.owner_id.clone())
         }
+        None => (auth.kind.clone(), auth.id.to_string()),
+    };
+    let activity = state.owner_activity.admit(&owner_type, &owner_id)?;
+    if let Some(expected) = existing {
+        // An intervening Conversation delete must not silently change ownership.
+        let current = load_web_session(state, &expected.id.to_string())?;
+        ensure_session_access(auth, &current)?;
+        if current.agent_id != expected.agent_id
+            || current.owner_type != owner_type
+            || current.owner_id != owner_id
+        {
+            return Err(AppError::new(
+                StatusCode::CONFLICT,
+                "Conversation changed; retry",
+            ));
+        }
+        return Ok((current, activity));
     }
 
     let now = chrono::Utc::now();
@@ -5400,6 +5451,7 @@ fn get_or_create_web_session(
         .find(session_id)
         .select(WebSessionRow::as_select())
         .first(&mut *conn)
+        .map(|session| (session, activity))
         .map_err(internal_error)
 }
 

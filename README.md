@@ -146,3 +146,22 @@ capability the agent retains SQL/ID answers. Raw lookup values and predicates
 are transient model input, omitted from traces and persisted tool messages.
 The parent application defines the shared contract in
 `docs/contracts/admin-user-lookup.md`.
+
+### Enclave User deletion
+
+The private `POST /internal/lifecycle/users/{user_id}/delete` route requires
+`X-Internal-Agent-Token`. It transactionally purges User-owned Conversations,
+active memory, and external identity metadata. The Python control plane removes
+the account and records durable cleanup intent before calling this route.
+Active turns return retryable `busy`; an Admin retries through Data Lifecycle.
+
+This guarantee requires one Sage process. Turn admission includes streamed bodies
+and Admin continuation of User-owned Conversations. Process-local deletion marks
+block requests authenticated before local removal. Restarting the process drops
+those requests; Python rejects new authentication for a removed account. Multiple
+Sage replicas require shared coordination before enabling this guarantee.
+
+Run isolated storage coverage with `USER_DELETION_TEST_DATABASE_URL` and
+`DATABASE_URL` pointing at a disposable pgvector PostgreSQL database:
+`cargo test -p sage-core user_deletion --lib -- --include-ignored`.
+The test applies migrations and uses rollback for synthetic fixtures.
